@@ -17,6 +17,7 @@ Ade is a high-performance sidechain that extends Solana's capabilities to provid
 - **Proof-of-Stake Consensus**: Energy-efficient validator selection
 - **High Throughput**: Low-latency transaction processing optimized for AI workloads
 - **Multi-language SDKs**: TypeScript, Python, and Rust support
+- **Type-Safe API**: Comprehensive TypeScript interfaces with full type safety
 
 ## Architecture
 
@@ -116,19 +117,62 @@ See [Bridge Documentation](docs/bridge.md) for details.
 
 ## SDKs
 
-### TypeScript
+### TypeScript (Type-Safe API)
 
 ```typescript
-import { AdeSidechainClient, AIAgentClient } from 'ade-sidechain';
+import { createAdeClient, AdeError } from 'ade-sidechain';
 
-const client = new AdeSidechainClient('http://localhost:8899');
-const aiAgent = new AIAgentClient(client);
+// Initialize with full type safety
+const client = createAdeClient({
+  rpcUrl: 'http://localhost:8899',
+  timeout: 30000,
+  retryAttempts: 3,
+  commitment: 'confirmed',
+});
 
-const result = await aiAgent.deploy(
-  'agent-id',
-  'model-hash',
-  config
-);
+// Deploy AI Agent
+const result = await client.deployAIAgent({
+  agentId: 'my-agent',
+  modelHash: 'QmXxYyZz...',
+  config: {
+    modelType: 'transformer',
+    parameters: { maxTokens: 512 },
+    maxExecutionTime: 30000,
+    allowedOperations: ['inference'],
+  },
+});
+
+// Execute with full type checking
+const execution = await client.executeAIAgent({
+  agentId: 'my-agent',
+  inputData: { prompt: 'Hello, AI!' },
+  maxCompute: 100000,
+});
+
+console.log('Output:', execution.output);
+console.log('Compute used:', execution.computeUnits);
+```
+
+**Type Definitions:**
+```typescript
+// All API methods are fully typed
+interface RpcApi {
+  getSlot(): Promise<Slot>;
+  getBalance(address: PublicKey): Promise<Balance>;
+  deployAIAgent(params: AIAgentDeployParams): Promise<AIAgentDeployResponse>;
+  executeAIAgent(params: AIAgentExecuteParams): Promise<AIAgentExecuteResponse>;
+  // ... and more
+}
+
+// Custom error handling
+try {
+  await client.sendTransaction(tx);
+} catch (error) {
+  if (error instanceof AdeError) {
+    console.error('Error code:', error.code);
+    console.error('Message:', error.message);
+  }
+}
 ```
 
 ### Python
@@ -152,6 +196,19 @@ let tx = TransactionBuilder::new()
     .set_recent_blockhash(blockhash)
     .build()?;
 ```
+
+## API Examples
+
+See [src/examples/api-usage.ts](src/examples/api-usage.ts) for comprehensive examples including:
+
+- Chain state queries
+- Account operations
+- AI agent deployment and execution
+- Bridge operations
+- Network monitoring
+- Error handling
+- Retry logic
+- Batch operations
 
 ## Documentation
 
@@ -189,6 +246,9 @@ ade/
 ├── bridge/         # Bridge components
 ├── native/         # Native C library
 ├── src/            # TypeScript SDK
+│   ├── api/        # Type-safe API client
+│   ├── types/      # TypeScript type definitions
+│   └── examples/   # Usage examples
 ├── python-sdk/     # Python SDK
 └── docs/           # Documentation
 ```
@@ -218,4 +278,3 @@ Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for gu
 ## Contact
 
 - Twitter: [@Ade__labs](https://twitter.com/Ade__labs)
-
