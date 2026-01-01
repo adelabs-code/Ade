@@ -2,10 +2,10 @@ pub mod transaction;
 pub mod instruction;
 pub mod account;
 pub mod validation;
+pub mod executor;
 
-pub use transaction::{Transaction, TransactionBuilder};
-pub use instruction::{Instruction, InstructionType};
+pub use transaction::{Transaction, TransactionBuilder, Message, MessageHeader, TransactionError};
+pub use instruction::{Instruction, InstructionType, AccountMeta};
 pub use account::{Account, AccountState};
 pub use validation::{TransactionValidator, ValidationError};
-
-
+pub use executor::{TransactionExecutor, InstructionExecutor, ExecutionResult, ExecutionContext};
