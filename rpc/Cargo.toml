@@ -20,4 +20,5 @@ bs58.workspace = true
 ade-transaction = { path = "../transaction" }
 ade-consensus = { path = "../consensus" }
 
-
+[dev-dependencies]
+tokio-test = "0.4"
