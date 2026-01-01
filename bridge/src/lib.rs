@@ -6,3 +6,4 @@ pub use bridge::{Bridge, BridgeConfig};
 pub use relayer::{Relayer, RelayerConfig};
 pub use lock_contract::{LockContract, DepositEvent, WithdrawalEvent};
 
+
