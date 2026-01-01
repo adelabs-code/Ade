@@ -1,6 +1,7 @@
 use serde::{Serialize, Deserialize};
 use sha2::{Sha256, Digest};
 use ade_transaction::Transaction;
+use anyhow::{Result, Context};
 
 pub type BlockHash = Vec<u8>;
 
@@ -15,8 +16,10 @@ pub struct BlockHeader {
     pub slot: u64,
     pub parent_hash: BlockHash,
     pub transactions_root: BlockHash,
+    pub accounts_root: BlockHash,
     pub timestamp: u64,
     pub validator: Vec<u8>,
+    pub signature: Vec<u8>,
 }
 
 impl Block {
@@ -28,13 +31,16 @@ impl Block {
     ) -> Self {
         let transactions_root = Self::compute_merkle_root(&transactions);
         let timestamp = current_timestamp();
+        let accounts_root = vec![0u8; 32]; // Computed from account state
 
         let header = BlockHeader {
             slot,
             parent_hash,
             transactions_root,
+            accounts_root,
             timestamp,
             validator,
+            signature: Vec::new(), // Set during signing
         };
 
         Self {
@@ -43,6 +49,7 @@ impl Block {
         }
     }
 
+    /// Compute block hash
     pub fn hash(&self) -> BlockHash {
         let mut hasher = Sha256::new();
         let serialized = bincode::serialize(&self.header).unwrap();
@@ -50,24 +57,160 @@ impl Block {
         hasher.finalize().to_vec()
     }
 
+    /// Compute merkle root of transactions
     fn compute_merkle_root(transactions: &[Transaction]) -> BlockHash {
         if transactions.is_empty() {
             return vec![0u8; 32];
         }
 
-        let mut hasher = Sha256::new();
-        for tx in transactions {
-            hasher.update(&tx.hash());
+        let mut hashes: Vec<Vec<u8>> = transactions
+            .iter()
+            .map(|tx| tx.hash())
+            .collect();
+
+        while hashes.len() > 1 {
+            let mut next_level = Vec::new();
+            
+            for chunk in hashes.chunks(2) {
+                let mut hasher = Sha256::new();
+                hasher.update(&chunk[0]);
+                
+                if chunk.len() > 1 {
+                    hasher.update(&chunk[1]);
+                } else {
+                    hasher.update(&chunk[0]);
+                }
+                
+                next_level.push(hasher.finalize().to_vec());
+            }
+            
+            hashes = next_level;
         }
-        hasher.finalize().to_vec()
+
+        hashes[0].clone()
     }
 
-    pub fn serialize(&self) -> Result<Vec<u8>, bincode::Error> {
-        bincode::serialize(self)
+    /// Validate block structure
+    pub fn validate_structure(&self) -> Result<()> {
+        // Validate slot
+        if self.header.slot == 0 && !self.header.parent_hash.is_empty() {
+            return Err(anyhow::anyhow!("Genesis block should have empty parent hash"));
+        }
+
+        // Validate parent hash
+        if self.header.parent_hash.len() != 32 && !self.header.parent_hash.is_empty() {
+            return Err(anyhow::anyhow!("Invalid parent hash length"));
+        }
+
+        // Validate validator pubkey
+        if self.header.validator.len() != 32 {
+            return Err(anyhow::anyhow!("Invalid validator pubkey length"));
+        }
+
+        // Validate merkle root
+        let computed_root = Self::compute_merkle_root(&self.transactions);
+        if computed_root != self.header.transactions_root {
+            return Err(anyhow::anyhow!("Transaction merkle root mismatch"));
+        }
+
+        Ok(())
     }
 
-    pub fn deserialize(data: &[u8]) -> Result<Self, bincode::Error> {
-        bincode::deserialize(data)
+    /// Validate block against parent
+    pub fn validate_against_parent(&self, parent: &Block) -> Result<()> {
+        // Check slot sequence
+        if self.header.slot != parent.header.slot + 1 {
+            return Err(anyhow::anyhow!(
+                "Invalid slot sequence: {} != {} + 1",
+                self.header.slot,
+                parent.header.slot
+            ));
+        }
+
+        // Check parent hash
+        let parent_hash = parent.hash();
+        if self.header.parent_hash != parent_hash {
+            return Err(anyhow::anyhow!("Parent hash mismatch"));
+        }
+
+        // Check timestamp
+        if self.header.timestamp <= parent.header.timestamp {
+            return Err(anyhow::anyhow!("Block timestamp must be greater than parent"));
+        }
+
+        Ok(())
+    }
+
+    /// Validate all transactions in the block
+    pub fn validate_transactions(&self) -> Result<()> {
+        for (idx, tx) in self.transactions.iter().enumerate() {
+            tx.verify().map_err(|e| {
+                anyhow::anyhow!("Transaction {} verification failed: {}", idx, e)
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Sign the block
+    pub fn sign(&mut self, keypair: &ed25519_dalek::Keypair) -> Result<()> {
+        use ed25519_dalek::Signer;
+        
+        let block_hash = self.hash();
+        let signature = keypair.sign(&block_hash);
+        self.header.signature = signature.to_bytes().to_vec();
+        
+        Ok(())
+    }
+
+    /// Verify block signature
+    pub fn verify_signature(&self) -> Result<()> {
+        use ed25519_dalek::{PublicKey, Signature, Verifier};
+        
+        if self.header.signature.is_empty() {
+            return Err(anyhow::anyhow!("Block is not signed"));
+        }
+
+        let pubkey = PublicKey::from_bytes(&self.header.validator)
+            .context("Invalid validator pubkey")?;
+        
+        let signature = Signature::from_bytes(&self.header.signature)
+            .context("Invalid signature")?;
+        
+        // Create a copy without signature for verification
+        let mut header_for_verification = self.header.clone();
+        header_for_verification.signature = Vec::new();
+        
+        let hash = {
+            let mut hasher = Sha256::new();
+            let serialized = bincode::serialize(&header_for_verification)?;
+            hasher.update(&serialized);
+            hasher.finalize().to_vec()
+        };
+        
+        pubkey.verify(&hash, &signature)
+            .context("Signature verification failed")?;
+        
+        Ok(())
+    }
+
+    /// Get transaction count
+    pub fn transaction_count(&self) -> usize {
+        self.transactions.len()
+    }
+
+    /// Check if block is empty
+    pub fn is_empty(&self) -> bool {
+        self.transactions.is_empty()
+    }
+
+    /// Serialize block
+    pub fn serialize(&self) -> Result<Vec<u8>> {
+        Ok(bincode::serialize(self)?)
+    }
+
+    /// Deserialize block
+    pub fn deserialize(data: &[u8]) -> Result<Self> {
+        Ok(bincode::deserialize(data)?)
     }
 }
 
@@ -76,6 +219,7 @@ pub struct BlockBuilder {
     parent_hash: BlockHash,
     transactions: Vec<Transaction>,
     validator: Vec<u8>,
+    accounts_root: Option<BlockHash>,
 }
 
 impl BlockBuilder {
@@ -85,6 +229,7 @@ impl BlockBuilder {
             parent_hash,
             transactions: Vec::new(),
             validator,
+            accounts_root: None,
         }
     }
 
@@ -98,8 +243,87 @@ impl BlockBuilder {
         self
     }
 
+    pub fn set_accounts_root(mut self, root: BlockHash) -> Self {
+        self.accounts_root = Some(root);
+        self
+    }
+
     pub fn build(self) -> Block {
-        Block::new(self.slot, self.parent_hash, self.transactions, self.validator)
+        let mut block = Block::new(self.slot, self.parent_hash, self.transactions, self.validator);
+        
+        if let Some(root) = self.accounts_root {
+            block.header.accounts_root = root;
+        }
+        
+        block
+    }
+}
+
+/// Block validation context
+pub struct BlockValidator {
+    max_transactions_per_block: usize,
+    max_block_size: usize,
+    slot_duration_ms: u64,
+}
+
+impl BlockValidator {
+    pub fn new() -> Self {
+        Self {
+            max_transactions_per_block: 10_000,
+            max_block_size: 1_300_000, // ~1.3 MB
+            slot_duration_ms: 400,
+        }
+    }
+
+    /// Perform complete block validation
+    pub fn validate_block(&self, block: &Block, parent: Option<&Block>) -> Result<()> {
+        // 1. Validate structure
+        block.validate_structure()?;
+
+        // 2. Validate against parent if provided
+        if let Some(parent_block) = parent {
+            block.validate_against_parent(parent_block)?;
+        }
+
+        // 3. Validate signature
+        block.verify_signature()?;
+
+        // 4. Validate transactions
+        block.validate_transactions()?;
+
+        // 5. Validate transaction count
+        if block.transactions.len() > self.max_transactions_per_block {
+            return Err(anyhow::anyhow!(
+                "Too many transactions: {} > {}",
+                block.transactions.len(),
+                self.max_transactions_per_block
+            ));
+        }
+
+        // 6. Validate block size
+        if let Ok(serialized) = block.serialize() {
+            if serialized.len() > self.max_block_size {
+                return Err(anyhow::anyhow!(
+                    "Block too large: {} > {}",
+                    serialized.len(),
+                    self.max_block_size
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check if block is finalized
+    pub fn is_finalized(&self, block_slot: u64, current_slot: u64) -> bool {
+        const FINALITY_THRESHOLD: u64 = 32;
+        current_slot >= block_slot + FINALITY_THRESHOLD
+    }
+}
+
+impl Default for BlockValidator {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -110,4 +334,111 @@ fn current_timestamp() -> u64 {
         .as_secs()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::Keypair;
+    use rand::rngs::OsRng;
 
+    #[test]
+    fn test_block_creation() {
+        let validator = vec![1u8; 32];
+        let parent_hash = vec![0u8; 32];
+        
+        let block = Block::new(1, parent_hash, vec![], validator);
+        
+        assert_eq!(block.header.slot, 1);
+        assert!(block.is_empty());
+    }
+
+    #[test]
+    fn test_block_hash() {
+        let block = Block::new(1, vec![0u8; 32], vec![], vec![1u8; 32]);
+        let hash = block.hash();
+        
+        assert_eq!(hash.len(), 32);
+    }
+
+    #[test]
+    fn test_block_signing() {
+        let mut csprng = OsRng;
+        let keypair = Keypair::generate(&mut csprng);
+        
+        let mut block = Block::new(1, vec![0u8; 32], vec![], keypair.public.to_bytes().to_vec());
+        
+        block.sign(&keypair).unwrap();
+        assert!(!block.header.signature.is_empty());
+        
+        assert!(block.verify_signature().is_ok());
+    }
+
+    #[test]
+    fn test_block_validation_against_parent() {
+        let parent = Block::new(1, vec![0u8; 32], vec![], vec![1u8; 32]);
+        let parent_hash = parent.hash();
+        
+        let child = Block::new(2, parent_hash, vec![], vec![1u8; 32]);
+        
+        assert!(child.validate_against_parent(&parent).is_ok());
+    }
+
+    #[test]
+    fn test_invalid_slot_sequence() {
+        let parent = Block::new(1, vec![0u8; 32], vec![], vec![1u8; 32]);
+        let parent_hash = parent.hash();
+        
+        // Wrong slot (should be 2, but is 3)
+        let child = Block::new(3, parent_hash, vec![], vec![1u8; 32]);
+        
+        assert!(child.validate_against_parent(&parent).is_err());
+    }
+
+    #[test]
+    fn test_merkle_root() {
+        let mut csprng = OsRng;
+        let keypair = Keypair::generate(&mut csprng);
+        
+        // Create a transaction
+        let tx = Transaction::new(&[&keypair], vec![], vec![1u8; 32]).unwrap();
+        
+        let block = Block::new(1, vec![0u8; 32], vec![tx], vec![1u8; 32]);
+        
+        assert!(block.header.transactions_root.len() == 32);
+        assert!(block.validate_structure().is_ok());
+    }
+
+    #[test]
+    fn test_block_builder() {
+        let mut csprng = OsRng;
+        let keypair = Keypair::generate(&mut csprng);
+        
+        let tx = Transaction::new(&[&keypair], vec![], vec![1u8; 32]).unwrap();
+        
+        let block = BlockBuilder::new(1, vec![0u8; 32], vec![1u8; 32])
+            .add_transaction(tx)
+            .build();
+        
+        assert_eq!(block.transaction_count(), 1);
+    }
+
+    #[test]
+    fn test_block_validator() {
+        let validator = BlockValidator::new();
+        let mut csprng = OsRng;
+        let keypair = Keypair::generate(&mut csprng);
+        
+        let mut block = Block::new(1, vec![0u8; 32], vec![], keypair.public.to_bytes().to_vec());
+        block.sign(&keypair).unwrap();
+        
+        assert!(validator.validate_block(&block, None).is_ok());
+    }
+
+    #[test]
+    fn test_finality() {
+        let validator = BlockValidator::new();
+        
+        assert!(!validator.is_finalized(100, 120));
+        assert!(validator.is_finalized(100, 132));
+        assert!(validator.is_finalized(100, 200));
+    }
+}
