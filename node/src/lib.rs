@@ -6,6 +6,7 @@ pub mod indexer;
 pub mod peer_discovery;
 pub mod ai_runtime;
 pub mod compute_meter;
+pub mod mempool;
 
 pub use node::{Node, NodeConfig, NodeState};
 pub use storage::{Storage, StorageStats};
@@ -15,3 +16,4 @@ pub use indexer::{SecondaryIndex, IndexStats};
 pub use peer_discovery::{PeerDiscovery, DiscoveredPeer, PeerScore, DiscoveryStats};
 pub use ai_runtime::{AIRuntime, AIAgentState, AgentConfig, AgentStatus, ExecutionRequest, ExecutionResult, RuntimeStats};
 pub use compute_meter::{ComputeMeter, ComputeCosts, ComputeStats, ComputeError, AIComputeEstimator};
+pub use mempool::{Mempool, MempoolTransaction, MempoolConfig, MempoolStats};
