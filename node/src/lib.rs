@@ -10,6 +10,7 @@ pub mod mempool;
 pub mod fee_market;
 pub mod block_producer;
 pub mod state_transition;
+pub mod transport;
 
 pub use node::{Node, NodeConfig, NodeState};
 pub use storage::{Storage, StorageStats};
@@ -23,3 +24,4 @@ pub use mempool::{Mempool, MempoolTransaction, MempoolConfig, MempoolStats};
 pub use fee_market::{FeeMarket, FeeMarketConfig, BlockFeeData, FeeEstimate, FeeMarketStats};
 pub use block_producer::{BlockProducer, ProducerConfig, BlockProductionResult, ProducerStats};
 pub use state_transition::{StateTransition, TransitionResult, AccountChange};
+pub use transport::Transport;
