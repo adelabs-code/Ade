@@ -55,3 +55,4 @@ int32_t ade_compute_merkle_root(
 #endif // ADE_NATIVE_H
 
 
+
