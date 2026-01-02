@@ -12,6 +12,7 @@ pub mod block_producer;
 pub mod state_transition;
 pub mod transport;
 pub mod protocol;
+pub mod snapshot;
 
 pub use node::{Node, NodeConfig, NodeState};
 pub use storage::{Storage, StorageStats};
@@ -27,3 +28,4 @@ pub use block_producer::{BlockProducer, ProducerConfig, BlockProductionResult, P
 pub use state_transition::{StateTransition, TransitionResult, AccountChange};
 pub use transport::Transport;
 pub use protocol::{Protocol, MessageHeader, MessageType, Compression};
+pub use snapshot::{SnapshotManager, SnapshotMetadata, SnapshotManifest};
