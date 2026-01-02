@@ -6,6 +6,7 @@ members = [
     "consensus",
     "bridge",
     "native",
+    "cli",
 ]
 resolver = "2"
 
