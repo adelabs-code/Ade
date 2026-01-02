@@ -8,6 +8,7 @@ pub mod ai_runtime;
 pub mod compute_meter;
 pub mod mempool;
 pub mod fee_market;
+pub mod block_producer;
 
 pub use node::{Node, NodeConfig, NodeState};
 pub use storage::{Storage, StorageStats};
@@ -19,3 +20,4 @@ pub use ai_runtime::{AIRuntime, AIAgentState, AgentConfig, AgentStatus, Executio
 pub use compute_meter::{ComputeMeter, ComputeCosts, ComputeStats, ComputeError, AIComputeEstimator};
 pub use mempool::{Mempool, MempoolTransaction, MempoolConfig, MempoolStats};
 pub use fee_market::{FeeMarket, FeeMarketConfig, BlockFeeData, FeeEstimate, FeeMarketStats};
+pub use block_producer::{BlockProducer, ProducerConfig, BlockProductionResult, ProducerStats};
