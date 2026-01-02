@@ -13,6 +13,7 @@ pub mod state_transition;
 pub mod transport;
 pub mod protocol;
 pub mod snapshot;
+pub mod metrics;
 
 pub use node::{Node, NodeConfig, NodeState};
 pub use storage::{Storage, StorageStats};
@@ -29,3 +30,4 @@ pub use state_transition::{StateTransition, TransitionResult, AccountChange};
 pub use transport::Transport;
 pub use protocol::{Protocol, MessageHeader, MessageType, Compression};
 pub use snapshot::{SnapshotManager, SnapshotMetadata, SnapshotManifest};
+pub use metrics::{MetricsCollector, MetricsSnapshot, HistogramStats};
