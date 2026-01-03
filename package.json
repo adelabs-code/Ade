@@ -19,11 +19,14 @@
     "axios": "^1.6.2",
     "borsh": "^0.7.0",
     "bn.js": "^5.2.1",
-    "buffer-layout": "^1.2.2"
+    "buffer-layout": "^1.2.2",
+    "ws": "^8.14.2",
+    "events": "^3.3.0"
   },
   "devDependencies": {
     "@types/node": "^20.10.4",
     "@types/jest": "^29.5.10",
+    "@types/ws": "^8.5.9",
     "@typescript-eslint/eslint-plugin": "^6.13.2",
     "@typescript-eslint/parser": "^6.13.2",
     "eslint": "^8.55.0",
@@ -33,6 +36,3 @@
     "typescript": "^5.3.3"
   }
 }
-
-
-

@@ -9,5 +9,6 @@ export * from './bridge-advanced';
 export * from './ai-agent';
 export * from './ai-agent-advanced';
 export * from './wallet';
+export * from './websocket-client';
 export * from './types';
 export * from './api';
