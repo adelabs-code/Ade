@@ -7,5 +7,6 @@ export * from './account-manager';
 export * from './bridge';
 export * from './bridge-advanced';
 export * from './ai-agent';
+export * from './ai-agent-advanced';
 export * from './types';
 export * from './api';
