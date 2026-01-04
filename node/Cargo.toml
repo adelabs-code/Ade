@@ -25,9 +25,20 @@ byteorder.workspace = true
 crc32fast.workspace = true
 flate2 = "1.0"
 
+# ONNX Runtime
+ort = "2.0.0-rc.2"
+ndarray = "0.15"
+
+# PyTorch (via tch-rs)
+tch = { version = "0.15", optional = true }
+
 ade-transaction = { path = "../transaction" }
 ade-consensus = { path = "../consensus" }
 
 [dev-dependencies]
 tempfile = "3.8"
 rand = "0.8"
+
+[features]
+default = []
+pytorch = ["tch"]
