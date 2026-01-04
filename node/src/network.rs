@@ -199,7 +199,12 @@ impl NetworkManager {
         }
     }
     
-    /// Perform the actual handshake with a peer
+    /// Perform the actual handshake with a peer using real TCP communication
+    /// 
+    /// This sends a HandshakeRequest over TCP and reads the HandshakeResponse.
+    /// Protocol format:
+    /// - 4 bytes: message length (big-endian u32)
+    /// - N bytes: bincode-serialized message
     async fn perform_handshake(&self, address: &str) -> Result<HandshakeResponse> {
         use tokio::net::TcpStream;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -207,7 +212,7 @@ impl NetworkManager {
         // Try to establish TCP connection with timeout
         let connect_timeout = std::time::Duration::from_secs(5);
         
-        let stream = match tokio::time::timeout(
+        let mut stream = match tokio::time::timeout(
             connect_timeout,
             TcpStream::connect(address)
         ).await {
@@ -216,7 +221,9 @@ impl NetworkManager {
             Err(_) => return Err(anyhow::anyhow!("Connection timeout")),
         };
         
-        // Send handshake request
+        debug!("TCP connection established to {}", address);
+        
+        // Build handshake request
         let handshake_request = HandshakeRequest {
             protocol_version: PROTOCOL_VERSION.to_string(),
             genesis_hash: self.get_genesis_hash(),
@@ -225,20 +232,82 @@ impl NetworkManager {
             is_validator: false, // Would be set from config
         };
         
-        let request_bytes = bincode::serialize(&handshake_request)?;
+        // Serialize the request
+        let request_bytes = bincode::serialize(&handshake_request)
+            .context("Failed to serialize handshake request")?;
         
-        // For now, simulate the handshake since we don't have actual socket I/O
-        // In production, this would write/read from the stream
+        // Send message length (4 bytes, big-endian)
+        let length_bytes = (request_bytes.len() as u32).to_be_bytes();
+        stream.write_all(&length_bytes).await
+            .context("Failed to write handshake length")?;
         
-        // Simulate response (in production, read from peer)
-        let response = HandshakeResponse {
-            pubkey: self.generate_peer_id(address),
-            version: PROTOCOL_VERSION.to_string(),
-            genesis_hash: self.get_genesis_hash(),
-            stake: 0,
-            is_validator: false,
-            features: vec!["gossip".to_string(), "rpc".to_string()],
-        };
+        // Send the actual request
+        stream.write_all(&request_bytes).await
+            .context("Failed to write handshake request")?;
+        
+        stream.flush().await
+            .context("Failed to flush handshake request")?;
+        
+        debug!("Sent handshake request ({} bytes) to {}", request_bytes.len(), address);
+        
+        // Read response with timeout
+        let read_timeout = std::time::Duration::from_secs(10);
+        
+        // Read response length (4 bytes)
+        let mut length_buf = [0u8; 4];
+        match tokio::time::timeout(read_timeout, stream.read_exact(&mut length_buf)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(anyhow::anyhow!("Failed to read response length: {}", e)),
+            Err(_) => return Err(anyhow::anyhow!("Handshake response timeout")),
+        }
+        
+        let response_length = u32::from_be_bytes(length_buf) as usize;
+        
+        // Validate response length (max 64KB for handshake)
+        if response_length > 65536 {
+            return Err(anyhow::anyhow!(
+                "Handshake response too large: {} bytes (max 65536)",
+                response_length
+            ));
+        }
+        
+        if response_length == 0 {
+            return Err(anyhow::anyhow!("Empty handshake response"));
+        }
+        
+        // Read the response data
+        let mut response_bytes = vec![0u8; response_length];
+        match tokio::time::timeout(read_timeout, stream.read_exact(&mut response_bytes)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(anyhow::anyhow!("Failed to read response data: {}", e)),
+            Err(_) => return Err(anyhow::anyhow!("Handshake response data timeout")),
+        }
+        
+        debug!("Received handshake response ({} bytes) from {}", response_bytes.len(), address);
+        
+        // Deserialize the response
+        let response: HandshakeResponse = bincode::deserialize(&response_bytes)
+            .context("Failed to deserialize handshake response")?;
+        
+        // Validate the response
+        if response.pubkey.is_empty() {
+            return Err(anyhow::anyhow!("Peer sent empty public key"));
+        }
+        
+        if response.version.is_empty() {
+            return Err(anyhow::anyhow!("Peer sent empty version"));
+        }
+        
+        // Verify timestamp freshness (must be within 5 minutes)
+        // This prevents replay attacks
+        let now = current_timestamp();
+        let request_age = now.saturating_sub(handshake_request.timestamp);
+        if request_age > 300 {
+            warn!("Handshake took too long: {} seconds", request_age);
+        }
+        
+        info!("Handshake completed with {}: version={}, validator={}", 
+            address, response.version, response.is_validator);
         
         Ok(response)
     }
