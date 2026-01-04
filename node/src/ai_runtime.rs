@@ -3,8 +3,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use serde::{Serialize, Deserialize};
 use tracing::{info, warn, debug};
+use ndarray::{ArrayD, IxDyn};
 
 use crate::utils::{current_timestamp, hash_data, to_base58};
+use crate::ai_inference::{OnnxInference, OnnxModel, ModelCache};
+#[cfg(feature = "pytorch")]
+use crate::ai_pytorch::{PyTorchInference, PyTorchModel};
 
 /// AI Agent runtime environment with actual execution support
 pub struct AIRuntime {
@@ -13,6 +17,12 @@ pub struct AIRuntime {
     execution_history: Arc<RwLock<Vec<ExecutionRecord>>>,
     max_concurrent_executions: usize,
     max_execution_time_ms: u64,
+    /// Model cache for loaded ONNX models
+    model_cache: Arc<ModelCache>,
+    /// ONNX inference engine
+    onnx_inference: Arc<OnnxInference>,
+    /// Model storage path for loading models by hash
+    model_storage_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,13 +91,64 @@ pub struct ExecutionResult {
 
 impl AIRuntime {
     pub fn new(max_concurrent_executions: usize, max_execution_time_ms: u64) -> Self {
+        Self::with_model_path(max_concurrent_executions, max_execution_time_ms, "./models".to_string())
+    }
+
+    pub fn with_model_path(max_concurrent_executions: usize, max_execution_time_ms: u64, model_storage_path: String) -> Self {
+        let onnx_inference = OnnxInference::new()
+            .expect("Failed to initialize ONNX inference engine");
+        
         Self {
             agents: Arc::new(RwLock::new(HashMap::new())),
             execution_cache: Arc::new(RwLock::new(HashMap::new())),
             execution_history: Arc::new(RwLock::new(Vec::new())),
             max_concurrent_executions,
             max_execution_time_ms,
+            model_cache: Arc::new(ModelCache::new(100)), // Cache up to 100 models
+            onnx_inference: Arc::new(onnx_inference),
+            model_storage_path,
         }
+    }
+
+    /// Load a model by its hash from the model storage
+    fn load_model_by_hash(&self, model_hash: &[u8]) -> Result<Arc<OnnxModel>> {
+        let hash_str = to_base58(model_hash);
+        
+        self.model_cache.get_or_load(&hash_str, || {
+            let model_path = format!("{}/{}.onnx", self.model_storage_path, hash_str);
+            
+            // Check if model file exists
+            if std::path::Path::new(&model_path).exists() {
+                self.onnx_inference.load_model(&model_path)
+            } else {
+                // Try loading from model bytes stored in the cache directory
+                let bytes_path = format!("{}/{}.bin", self.model_storage_path, hash_str);
+                if std::path::Path::new(&bytes_path).exists() {
+                    let model_bytes = std::fs::read(&bytes_path)
+                        .context("Failed to read model bytes")?;
+                    self.onnx_inference.load_model_from_bytes(&model_bytes)
+                } else {
+                    Err(anyhow::anyhow!("Model not found: {}", hash_str))
+                }
+            }
+        })
+    }
+
+    /// Store a model by its bytes and return the hash
+    pub fn store_model(&self, model_bytes: &[u8]) -> Result<Vec<u8>> {
+        let model_hash = hash_data(model_bytes);
+        let hash_str = to_base58(&model_hash);
+        
+        // Create model storage directory if it doesn't exist
+        std::fs::create_dir_all(&self.model_storage_path)
+            .context("Failed to create model storage directory")?;
+        
+        let bytes_path = format!("{}/{}.bin", self.model_storage_path, hash_str);
+        std::fs::write(&bytes_path, model_bytes)
+            .context("Failed to store model bytes")?;
+        
+        info!("Stored model with hash: {}", hash_str);
+        Ok(model_hash)
     }
 
     pub fn deploy_agent(
@@ -203,7 +264,7 @@ impl AIRuntime {
         })
     }
 
-    /// Execute AI model - actual implementation
+    /// Execute AI model - actual implementation with real inference
     async fn execute_ai_model(
         &self,
         agent: &AIAgentState,
@@ -228,13 +289,26 @@ impl AIRuntime {
             return Err(anyhow::anyhow!("Compute budget exceeded during input processing"));
         }
 
-        // 3. Execute based on model type
-        let (output, execution_cost) = match agent.config.model_type.as_str() {
-            "transformer" => self.execute_transformer(input_data, &agent.config).await?,
-            "cnn" => self.execute_cnn(input_data, &agent.config).await?,
-            "rnn" => self.execute_rnn(input_data, &agent.config).await?,
-            "embeddings" => self.execute_embeddings(input_data, &agent.config).await?,
-            _ => self.execute_generic(input_data, &agent.config).await?,
+        // 3. Try to load the actual model from cache
+        let model_result = self.load_model_by_hash(&agent.model_hash);
+        
+        // 4. Execute based on model availability and type
+        let (output, execution_cost) = match model_result {
+            Ok(model) => {
+                // Real model inference
+                self.execute_with_real_model(&model, input_data, &agent.config, max_compute - compute_used).await?
+            }
+            Err(e) => {
+                // Fallback to simulated execution if model not found
+                debug!("Model not found ({}), using simulated execution", e);
+                match agent.config.model_type.as_str() {
+                    "transformer" => self.execute_transformer_simulated(input_data, &agent.config).await?,
+                    "cnn" => self.execute_cnn_simulated(input_data, &agent.config).await?,
+                    "rnn" => self.execute_rnn_simulated(input_data, &agent.config).await?,
+                    "embeddings" => self.execute_embeddings_simulated(input_data, &agent.config).await?,
+                    _ => self.execute_generic_simulated(input_data, &agent.config).await?,
+                }
+            }
         };
 
         compute_used += execution_cost;
@@ -243,15 +317,84 @@ impl AIRuntime {
             return Err(anyhow::anyhow!("Compute budget exceeded during execution"));
         }
 
-        // 4. Output processing cost
+        // 5. Output processing cost
         let output_processing_cost = (output.len() as u64) * 5;
         compute_used += output_processing_cost;
 
         Ok((output, compute_used.min(max_compute)))
     }
 
-    /// Execute transformer model
-    async fn execute_transformer(
+    /// Execute inference with a real loaded ONNX model
+    async fn execute_with_real_model(
+        &self,
+        model: &OnnxModel,
+        input_data: &[u8],
+        config: &AgentConfig,
+        remaining_compute: u64,
+    ) -> Result<(Vec<u8>, u64)> {
+        let start_time = std::time::Instant::now();
+        
+        // Parse input based on model type
+        let output_data = match config.model_type.as_str() {
+            "transformer" | "embeddings" => {
+                // Text input - use infer_text
+                let input_text = String::from_utf8_lossy(input_data);
+                let max_length = config.parameters.get("maxTokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(512) as usize;
+                
+                let output = model.infer_text(&input_text, max_length)?;
+                
+                serde_json::json!({
+                    "model": config.model_type,
+                    "input_length": input_text.len(),
+                    "output_shape": [output.len()],
+                    "output": output,
+                    "timestamp": current_timestamp(),
+                    "inference_type": "real"
+                }).to_string().into_bytes()
+            }
+            "cnn" | "rnn" | _ => {
+                // Binary/tensor input - convert to float array
+                let input_floats: Vec<f32> = input_data.iter()
+                    .map(|&b| b as f32 / 255.0) // Normalize to [0, 1]
+                    .collect();
+                
+                let input_shape = IxDyn(&[1, input_floats.len()]);
+                let input_array = ArrayD::from_shape_vec(input_shape, input_floats)
+                    .context("Failed to create input tensor")?;
+                
+                let outputs = model.infer(input_array)?;
+                
+                let output_vecs: Vec<Vec<f32>> = outputs.iter()
+                    .map(|arr| arr.iter().cloned().collect())
+                    .collect();
+                
+                serde_json::json!({
+                    "model": config.model_type,
+                    "input_size": input_data.len(),
+                    "output_count": outputs.len(),
+                    "outputs": output_vecs,
+                    "timestamp": current_timestamp(),
+                    "inference_type": "real"
+                }).to_string().into_bytes()
+            }
+        };
+        
+        let execution_time_ms = start_time.elapsed().as_millis() as u64;
+        
+        // Compute cost based on actual execution time
+        // 1 compute unit per microsecond
+        let compute_cost = (start_time.elapsed().as_micros() as u64)
+            .min(remaining_compute);
+        
+        info!("Real model inference completed in {}ms, compute cost: {}", execution_time_ms, compute_cost);
+        
+        Ok((output_data, compute_cost))
+    }
+
+    /// Execute transformer model (simulated fallback)
+    async fn execute_transformer_simulated(
         &self,
         input_data: &[u8],
         config: &AgentConfig,
@@ -276,7 +419,7 @@ impl AIRuntime {
         let per_token_cost = 100u64;
         let compute_cost = base_cost + (input_tokens * per_token_cost) + (max_tokens * per_token_cost);
 
-        // Generate output (in production, this would call actual inference)
+        // Generate simulated output
         let output = serde_json::json!({
             "model": "transformer",
             "input_length": input_text.len(),
@@ -285,13 +428,14 @@ impl AIRuntime {
             "temperature": temperature,
             "result": format!("Processed: {} chars", input_text.len()),
             "timestamp": current_timestamp(),
+            "inference_type": "simulated"
         });
 
         Ok((output.to_string().into_bytes(), compute_cost))
     }
 
-    /// Execute CNN model
-    async fn execute_cnn(
+    /// Execute CNN model (simulated fallback)
+    async fn execute_cnn_simulated(
         &self,
         input_data: &[u8],
         config: &AgentConfig,
@@ -309,16 +453,17 @@ impl AIRuntime {
             "input_size": input_size,
             "features_extracted": input_size / 100, // Simplified
             "timestamp": current_timestamp(),
+            "inference_type": "simulated"
         });
 
         Ok((output.to_string().into_bytes(), compute_cost))
     }
 
-    /// Execute RNN model
-    async fn execute_rnn(
+    /// Execute RNN model (simulated fallback)
+    async fn execute_rnn_simulated(
         &self,
         input_data: &[u8],
-        config: &AgentConfig,
+        _config: &AgentConfig,
     ) -> Result<(Vec<u8>, u64)> {
         let sequence_length = input_data.len() / 4; // Assume 4 bytes per element
         
@@ -330,13 +475,14 @@ impl AIRuntime {
             "model": "rnn",
             "sequence_length": sequence_length,
             "timestamp": current_timestamp(),
+            "inference_type": "simulated"
         });
 
         Ok((output.to_string().into_bytes(), compute_cost))
     }
 
-    /// Execute embeddings model
-    async fn execute_embeddings(
+    /// Execute embeddings model (simulated fallback)
+    async fn execute_embeddings_simulated(
         &self,
         input_data: &[u8],
         config: &AgentConfig,
@@ -353,9 +499,14 @@ impl AIRuntime {
         let dim_multiplier = (embedding_dim / 100).max(1);
         let compute_cost = base_cost + (input_tokens * per_token_cost * dim_multiplier);
 
-        // Generate mock embeddings
+        // Generate deterministic pseudo-embeddings based on input hash
+        let input_hash = hash_data(input_data);
+        let seed = u64::from_le_bytes(input_hash[0..8].try_into().unwrap_or([0u8; 8]));
         let embeddings: Vec<f32> = (0..embedding_dim)
-            .map(|i| (i as f32 * 0.01) % 1.0)
+            .map(|i| {
+                let val = ((seed.wrapping_add(i)) % 1000) as f32 / 1000.0;
+                (val * 2.0) - 1.0 // Normalize to [-1, 1]
+            })
             .collect();
 
         let output = serde_json::json!({
@@ -364,16 +515,17 @@ impl AIRuntime {
             "embedding_dim": embedding_dim,
             "embeddings": embeddings,
             "timestamp": current_timestamp(),
+            "inference_type": "simulated"
         });
 
         Ok((output.to_string().into_bytes(), compute_cost))
     }
 
-    /// Execute generic model
-    async fn execute_generic(
+    /// Execute generic model (simulated fallback)
+    async fn execute_generic_simulated(
         &self,
         input_data: &[u8],
-        config: &AgentConfig,
+        _config: &AgentConfig,
     ) -> Result<(Vec<u8>, u64)> {
         let input_size = input_data.len() as u64;
         
@@ -386,6 +538,7 @@ impl AIRuntime {
             "input_size": input_size,
             "processed": true,
             "timestamp": current_timestamp(),
+            "inference_type": "simulated"
         });
 
         Ok((output.to_string().into_bytes(), compute_cost))
@@ -578,6 +731,7 @@ pub struct RuntimeStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     fn create_test_config() -> AgentConfig {
         AgentConfig {
@@ -589,9 +743,19 @@ mod tests {
         }
     }
 
+    fn create_test_runtime() -> (AIRuntime, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let runtime = AIRuntime::with_model_path(
+            10, 
+            30000, 
+            temp_dir.path().to_str().unwrap().to_string()
+        );
+        (runtime, temp_dir)
+    }
+
     #[test]
     fn test_deploy_agent() {
-        let runtime = AIRuntime::new(10, 30000);
+        let (runtime, _temp_dir) = create_test_runtime();
         
         let agent_id = vec![1u8; 32];
         let model_hash = vec![2u8; 32];
@@ -607,7 +771,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_transformer() {
-        let runtime = AIRuntime::new(10, 30000);
+        let (runtime, _temp_dir) = create_test_runtime();
         
         let agent_id = vec![1u8; 32];
         let owner = vec![3u8; 32];
@@ -628,11 +792,15 @@ mod tests {
         assert!(result.success);
         assert!(result.compute_units_used > 10000); // Should include model load cost
         assert!(!result.output_data.is_empty());
+        
+        // Verify output indicates simulated inference (since no model file exists)
+        let output: serde_json::Value = serde_json::from_slice(&result.output_data).unwrap();
+        assert_eq!(output["inference_type"], "simulated");
     }
 
     #[tokio::test]
     async fn test_execution_history() {
-        let runtime = AIRuntime::new(10, 30000);
+        let (runtime, _temp_dir) = create_test_runtime();
         
         let agent_id = vec![1u8; 32];
         let owner = vec![3u8; 32];
@@ -653,5 +821,18 @@ mod tests {
         
         let history = runtime.get_execution_history(&agent_id, 10);
         assert_eq!(history.len(), 5);
+    }
+
+    #[test]
+    fn test_model_storage() {
+        let (runtime, _temp_dir) = create_test_runtime();
+        
+        // Store a dummy model
+        let model_bytes = b"dummy model content";
+        let result = runtime.store_model(model_bytes);
+        assert!(result.is_ok());
+        
+        let model_hash = result.unwrap();
+        assert_eq!(model_hash.len(), 32);
     }
 }
