@@ -98,12 +98,34 @@ impl Block {
         Ok(())
     }
 
+    /// Validate block against its parent
+    /// 
+    /// IMPORTANT: Slots can be skipped in PoS when leaders miss their turn.
+    /// The slot must be GREATER than parent slot, not necessarily parent + 1.
+    /// This allows the chain to continue even if validators go offline.
     pub fn validate_against_parent(&self, parent: &Block) -> Result<()> {
-        if self.header.slot != parent.header.slot + 1 {
+        // Slot must be strictly greater than parent (allows skipped slots)
+        // This is CRITICAL for liveness - without this, a single offline validator
+        // would permanently halt the chain
+        if self.header.slot <= parent.header.slot {
             return Err(anyhow::anyhow!(
-                "Invalid slot sequence: {} != {} + 1",
+                "Invalid slot sequence: {} must be > {} (parent slot)",
                 self.header.slot,
                 parent.header.slot
+            ));
+        }
+        
+        // Maximum slot gap to prevent extremely old blocks
+        // 1000 slots ≈ 400 seconds at 400ms/slot
+        const MAX_SLOT_GAP: u64 = 1000;
+        let slot_gap = self.header.slot - parent.header.slot;
+        if slot_gap > MAX_SLOT_GAP {
+            return Err(anyhow::anyhow!(
+                "Slot gap too large: {} - {} = {} (max: {})",
+                self.header.slot,
+                parent.header.slot,
+                slot_gap,
+                MAX_SLOT_GAP
             ));
         }
 
@@ -114,6 +136,21 @@ impl Block {
 
         if self.header.timestamp <= parent.header.timestamp {
             return Err(anyhow::anyhow!("Block timestamp must be greater than parent"));
+        }
+        
+        // Validate timestamp is reasonable for the slot gap
+        // Each slot is ~400ms, so the timestamp should increase accordingly
+        let min_expected_time_increase_ms = (slot_gap as u128) * 400;
+        let actual_time_increase_ms = (self.header.timestamp - parent.header.timestamp) as u128 * 1000;
+        
+        // Allow some variance (±50%) to account for clock skew
+        if actual_time_increase_ms < min_expected_time_increase_ms / 2 {
+            return Err(anyhow::anyhow!(
+                "Timestamp increase too small for slot gap: {} slots should be ~{}ms, got ~{}ms",
+                slot_gap,
+                min_expected_time_increase_ms,
+                actual_time_increase_ms
+            ));
         }
 
         Ok(())
@@ -353,13 +390,30 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_slot_sequence() {
+    fn test_skipped_slot_allowed() {
+        // Skipped slots should be allowed (slot 3 after slot 1 = 1 skipped slot)
         let parent = Block::new(1, vec![0u8; 32], vec![], vec![1u8; 32]);
         let parent_hash = parent.hash();
         
         let child = Block::new(3, parent_hash, vec![], vec![1u8; 32]);
         
-        assert!(child.validate_against_parent(&parent).is_err());
+        // This should now succeed - skipped slots are valid in PoS
+        assert!(child.validate_against_parent(&parent).is_ok());
+    }
+    
+    #[test]
+    fn test_slot_must_increase() {
+        // Slot going backwards or staying the same should fail
+        let parent = Block::new(5, vec![0u8; 32], vec![], vec![1u8; 32]);
+        let parent_hash = parent.hash();
+        
+        // Same slot - should fail
+        let child_same = Block::new(5, parent_hash.clone(), vec![], vec![1u8; 32]);
+        assert!(child_same.validate_against_parent(&parent).is_err());
+        
+        // Earlier slot - should fail
+        let child_earlier = Block::new(3, parent_hash, vec![], vec![1u8; 32]);
+        assert!(child_earlier.validate_against_parent(&parent).is_err());
     }
 
     #[test]
