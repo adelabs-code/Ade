@@ -783,21 +783,45 @@ pub enum WithdrawalStatus {
     Failed,
 }
 
-/// Transaction executor
+/// Transaction executor with fee deduction
 pub struct TransactionExecutor {
     instruction_executor: InstructionExecutor,
     max_compute_budget: u64,
+    /// Base fee in lamports per transaction
+    base_fee: u64,
+    /// Fee per compute unit in lamports
+    fee_per_compute_unit: u64,
+    /// Account storage for fee deduction
+    accounts: Arc<RwLock<HashMap<Vec<u8>, Account>>>,
 }
 
 impl TransactionExecutor {
     pub fn new(accounts: Arc<RwLock<HashMap<Vec<u8>, Account>>>) -> Self {
         Self {
-            instruction_executor: InstructionExecutor::new(accounts),
+            instruction_executor: InstructionExecutor::new(accounts.clone()),
             max_compute_budget: 1_400_000,
+            base_fee: 5000,           // 5000 lamports base fee (like Solana)
+            fee_per_compute_unit: 1,  // 1 lamport per compute unit
+            accounts,
+        }
+    }
+    
+    /// Create executor with custom fee configuration
+    pub fn with_fees(
+        accounts: Arc<RwLock<HashMap<Vec<u8>, Account>>>,
+        base_fee: u64,
+        fee_per_compute_unit: u64,
+    ) -> Self {
+        Self {
+            instruction_executor: InstructionExecutor::new(accounts.clone()),
+            max_compute_budget: 1_400_000,
+            base_fee,
+            fee_per_compute_unit,
+            accounts,
         }
     }
 
-    /// Execute a transaction
+    /// Execute a transaction with fee deduction
     pub fn execute_transaction(
         &self,
         transaction: &Transaction,
@@ -807,13 +831,40 @@ impl TransactionExecutor {
         transaction.verify()
             .map_err(|e| anyhow::anyhow!("Signature verification failed: {}", e))?;
 
+        // Get fee payer (first signer in message)
+        let fee_payer = transaction.message.account_keys.first()
+            .ok_or_else(|| anyhow::anyhow!("No accounts in transaction"))?
+            .clone();
+
         // Create execution context
         let mut context = ExecutionContext::new(slot, self.max_compute_budget);
+        context.log(format!("Fee payer: {}", bs58::encode(&fee_payer).into_string()));
+
+        // STEP 1: Calculate maximum possible fee and verify balance
+        // Fee = base_fee + (max_compute_budget * fee_per_compute_unit)
+        let max_fee = self.calculate_max_fee();
+        
+        // Verify fee payer has sufficient balance before execution
+        {
+            let accounts = self.accounts.read().unwrap();
+            let fee_payer_account = accounts.get(&fee_payer)
+                .ok_or_else(|| anyhow::anyhow!("Fee payer account not found"))?;
+            
+            if fee_payer_account.lamports < max_fee {
+                return Err(anyhow::anyhow!(
+                    "Insufficient balance for fees: {} lamports required, {} available",
+                    max_fee,
+                    fee_payer_account.lamports
+                ));
+            }
+            context.log(format!("Pre-execution balance check passed: {} >= {}", 
+                fee_payer_account.lamports, max_fee));
+        }
         
         let mut all_modified_accounts = Vec::new();
         let mut total_compute = 0u64;
 
-        // Execute each instruction
+        // STEP 2: Execute each instruction
         for (idx, instruction) in transaction.message.instructions.iter().enumerate() {
             context.log(format!("--- Instruction {} ---", idx));
             
@@ -823,6 +874,10 @@ impl TransactionExecutor {
                     all_modified_accounts.extend(result.modified_accounts);
                     
                     if !result.success {
+                        // Even on failure, deduct fees for consumed compute
+                        self.deduct_fee(&fee_payer, total_compute, &mut context)?;
+                        all_modified_accounts.push(fee_payer.clone());
+                        
                         return Ok(ExecutionResult {
                             success: false,
                             compute_units_consumed: total_compute,
@@ -833,6 +888,10 @@ impl TransactionExecutor {
                     }
                 }
                 Err(e) => {
+                    // Deduct fees even on error (for consumed compute up to this point)
+                    let _ = self.deduct_fee(&fee_payer, total_compute, &mut context);
+                    all_modified_accounts.push(fee_payer.clone());
+                    
                     return Ok(ExecutionResult {
                         success: false,
                         compute_units_consumed: total_compute,
@@ -844,6 +903,13 @@ impl TransactionExecutor {
             }
         }
 
+        // STEP 3: Deduct actual fee based on compute used
+        let actual_fee = self.deduct_fee(&fee_payer, total_compute, &mut context)?;
+        all_modified_accounts.push(fee_payer.clone());
+        
+        context.log(format!("Transaction fee deducted: {} lamports ({} base + {} compute)", 
+            actual_fee, self.base_fee, total_compute * self.fee_per_compute_unit));
+
         Ok(ExecutionResult {
             success: true,
             compute_units_consumed: total_compute,
@@ -851,6 +917,59 @@ impl TransactionExecutor {
             error: None,
             modified_accounts: all_modified_accounts,
         })
+    }
+    
+    /// Calculate maximum possible fee for a transaction
+    fn calculate_max_fee(&self) -> u64 {
+        self.base_fee + (self.max_compute_budget * self.fee_per_compute_unit)
+    }
+    
+    /// Calculate actual fee based on compute used
+    fn calculate_actual_fee(&self, compute_used: u64) -> u64 {
+        self.base_fee + (compute_used * self.fee_per_compute_unit)
+    }
+    
+    /// Deduct fee from fee payer account
+    fn deduct_fee(
+        &self,
+        fee_payer: &[u8],
+        compute_used: u64,
+        context: &mut ExecutionContext,
+    ) -> Result<u64> {
+        let actual_fee = self.calculate_actual_fee(compute_used);
+        
+        let mut accounts = self.accounts.write().unwrap();
+        let fee_payer_account = accounts.get_mut(fee_payer)
+            .ok_or_else(|| anyhow::anyhow!("Fee payer account not found for deduction"))?;
+        
+        if fee_payer_account.lamports < actual_fee {
+            // This should not happen if pre-check passed, but handle gracefully
+            let available = fee_payer_account.lamports;
+            fee_payer_account.lamports = 0;
+            context.log(format!(
+                "WARNING: Insufficient balance for full fee. Deducted {} of {} required",
+                available, actual_fee
+            ));
+            return Ok(available);
+        }
+        
+        fee_payer_account.lamports -= actual_fee;
+        context.log(format!(
+            "Deducted {} lamports from fee payer (remaining: {})",
+            actual_fee, fee_payer_account.lamports
+        ));
+        
+        Ok(actual_fee)
+    }
+    
+    /// Get the base fee
+    pub fn get_base_fee(&self) -> u64 {
+        self.base_fee
+    }
+    
+    /// Get the fee per compute unit
+    pub fn get_fee_per_compute_unit(&self) -> u64 {
+        self.fee_per_compute_unit
     }
 }
 
