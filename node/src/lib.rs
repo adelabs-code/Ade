@@ -16,6 +16,7 @@ pub mod snapshot;
 pub mod metrics;
 pub mod performance;
 pub mod utils;
+pub mod errors;
 
 pub use node::{Node, NodeConfig, NodeState};
 pub use storage::{Storage, StorageStats};
@@ -35,3 +36,4 @@ pub use snapshot::{SnapshotManager, SnapshotMetadata, SnapshotManifest};
 pub use metrics::{MetricsCollector, MetricsSnapshot, HistogramStats};
 pub use performance::{PerformanceTracker, PerformanceSample, PerformanceReport};
 pub use utils::*;
+pub use errors::*;
