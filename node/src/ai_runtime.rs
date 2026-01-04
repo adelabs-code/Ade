@@ -4,6 +4,7 @@ use std::sync::{Arc, RwLock};
 use serde::{Serialize, Deserialize};
 use tracing::{info, warn, debug, error};
 use ndarray::{ArrayD, IxDyn};
+use tokio::sync::Semaphore;
 
 use crate::utils::{current_timestamp, hash_data, to_base58};
 use crate::ai_inference::{OnnxInference, OnnxModel, ModelCache};
@@ -11,6 +12,9 @@ use crate::ai_inference::{OnnxInference, OnnxModel, ModelCache};
 use crate::ai_pytorch::{PyTorchInference, PyTorchModel};
 
 /// AI Agent runtime environment with actual execution support
+/// 
+/// This runtime enforces concurrency limits using a semaphore to prevent
+/// resource exhaustion when multiple inference requests arrive simultaneously.
 pub struct AIRuntime {
     agents: Arc<RwLock<HashMap<Vec<u8>, AIAgentState>>>,
     execution_cache: Arc<RwLock<HashMap<Vec<u8>, ExecutionCache>>>,
@@ -25,6 +29,10 @@ pub struct AIRuntime {
     model_storage_path: String,
     /// Cache statistics for hit rate calculation
     cache_stats: Arc<RwLock<CacheStats>>,
+    /// Semaphore for limiting concurrent AI executions
+    execution_semaphore: Arc<Semaphore>,
+    /// Current number of active executions (for monitoring)
+    active_executions: Arc<RwLock<usize>>,
 }
 
 /// Statistics for cache hit rate calculation
@@ -32,6 +40,19 @@ pub struct AIRuntime {
 struct CacheStats {
     hits: u64,
     misses: u64,
+}
+
+/// RAII guard for tracking active executions
+/// Ensures the counter is decremented when dropped
+struct ExecutionGuard {
+    active_executions: Arc<RwLock<usize>>,
+}
+
+impl Drop for ExecutionGuard {
+    fn drop(&mut self) {
+        let mut active = self.active_executions.write().unwrap();
+        *active = active.saturating_sub(1);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +128,14 @@ impl AIRuntime {
         let onnx_inference = OnnxInference::new()
             .expect("Failed to initialize ONNX inference engine");
         
+        // Create semaphore with configured concurrency limit
+        let semaphore = Arc::new(Semaphore::new(max_concurrent_executions));
+        
+        info!(
+            "Initializing AI runtime with max {} concurrent executions, {} ms timeout",
+            max_concurrent_executions, max_execution_time_ms
+        );
+        
         Self {
             agents: Arc::new(RwLock::new(HashMap::new())),
             execution_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -117,7 +146,19 @@ impl AIRuntime {
             onnx_inference: Arc::new(onnx_inference),
             model_storage_path,
             cache_stats: Arc::new(RwLock::new(CacheStats::default())),
+            execution_semaphore: semaphore,
+            active_executions: Arc::new(RwLock::new(0)),
         }
+    }
+    
+    /// Get the current number of active AI executions
+    pub fn get_active_executions(&self) -> usize {
+        *self.active_executions.read().unwrap()
+    }
+    
+    /// Get the number of available execution slots
+    pub fn get_available_slots(&self) -> usize {
+        self.execution_semaphore.available_permits()
     }
 
     /// Load a model by its hash from the model storage
@@ -214,7 +255,7 @@ impl AIRuntime {
 
         let input_hash = hash_data(&request.input_data);
         
-        // Check cache for existing execution result
+        // Check cache for existing execution result (no semaphore needed for cache reads)
         if let Some(cached) = self.get_cached_execution(&input_hash) {
             self.record_cache_hit();
             info!("Cache HIT - Using cached execution result");
@@ -234,6 +275,54 @@ impl AIRuntime {
         // Cache miss - will need to execute
         self.record_cache_miss();
 
+        // Acquire semaphore permit to limit concurrent executions
+        // This prevents resource exhaustion when many requests arrive simultaneously
+        let available_before = self.execution_semaphore.available_permits();
+        debug!(
+            "Waiting for execution slot ({}/{} available)",
+            available_before, self.max_concurrent_executions
+        );
+        
+        // Try to acquire permit with timeout to prevent indefinite blocking
+        let permit = match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            self.execution_semaphore.acquire()
+        ).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => {
+                return Err(anyhow::anyhow!(
+                    "Failed to acquire execution slot: semaphore closed"
+                ));
+            }
+            Err(_) => {
+                warn!(
+                    "Execution queue timeout: no slot available after 30s ({} active executions)",
+                    self.get_active_executions()
+                );
+                return Err(anyhow::anyhow!(
+                    "Execution timeout: all {} slots busy for 30+ seconds",
+                    self.max_concurrent_executions
+                ));
+            }
+        };
+        
+        // Track active executions
+        {
+            let mut active = self.active_executions.write().unwrap();
+            *active += 1;
+            debug!(
+                "Acquired execution slot ({}/{} now active)",
+                *active, self.max_concurrent_executions
+            );
+        }
+        
+        // Create guard to decrement active count on completion
+        // The permit is also kept in scope to be released when guard is dropped
+        let _guard = ExecutionGuard {
+            active_executions: self.active_executions.clone(),
+        };
+        let _permit = permit; // Keep permit in scope until function returns
+
         let start_time = std::time::Instant::now();
         let mut logs = Vec::new();
         
@@ -241,6 +330,10 @@ impl AIRuntime {
         logs.push(format!("Model type: {}", agent.config.model_type));
         logs.push(format!("Input size: {} bytes", request.input_data.len()));
         logs.push(format!("Max compute: {}", request.max_compute));
+        logs.push(format!(
+            "Concurrency: {}/{} slots in use",
+            self.get_active_executions(), self.max_concurrent_executions
+        ));
 
         // Execute AI model
         let (output, compute_used) = self.execute_ai_model(
