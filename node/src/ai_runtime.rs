@@ -4,6 +4,8 @@ use std::sync::{Arc, RwLock};
 use serde::{Serialize, Deserialize};
 use tracing::{info, warn, debug};
 
+use crate::utils::{current_timestamp, hash_data, to_base58};
+
 /// AI Agent runtime environment
 pub struct AIRuntime {
     agents: Arc<RwLock<HashMap<Vec<u8>, AIAgentState>>>,
@@ -76,7 +78,6 @@ impl AIRuntime {
         }
     }
 
-    /// Deploy a new AI agent
     pub fn deploy_agent(
         &self,
         agent_id: Vec<u8>,
@@ -102,14 +103,12 @@ impl AIRuntime {
         };
 
         agents.insert(agent_id.clone(), agent_state);
-        info!("Deployed AI agent: {:?}", bs58::encode(&agent_id).into_string());
+        info!("Deployed AI agent: {}", to_base58(&agent_id));
 
         Ok(())
     }
 
-    /// Execute an AI agent
     pub async fn execute_agent(&self, request: ExecutionRequest) -> Result<ExecutionResult> {
-        // Get agent state
         let agent = {
             let agents = self.agents.read().unwrap();
             agents.get(&request.agent_id)
@@ -117,12 +116,10 @@ impl AIRuntime {
                 .clone()
         };
 
-        // Check agent status
         if agent.status != AgentStatus::Active {
             return Err(anyhow::anyhow!("Agent is not active"));
         }
 
-        // Check compute budget
         if request.max_compute > agent.config.compute_budget {
             return Err(anyhow::anyhow!(
                 "Requested compute {} exceeds budget {}",
@@ -131,8 +128,7 @@ impl AIRuntime {
             ));
         }
 
-        // Check cache
-        let input_hash = self.hash_input(&request.input_data);
+        let input_hash = hash_data(&request.input_data);
         if let Some(cached) = self.get_cached_execution(&input_hash) {
             info!("Using cached execution result");
             return Ok(ExecutionResult {
@@ -145,21 +141,18 @@ impl AIRuntime {
             });
         }
 
-        // Execute agent
         let start_time = std::time::Instant::now();
         let mut logs = Vec::new();
         
-        logs.push(format!("Starting execution for agent: {:?}", bs58::encode(&request.agent_id).into_string()));
+        logs.push(format!("Starting execution for agent: {}", to_base58(&request.agent_id)));
         logs.push(format!("Max compute: {}", request.max_compute));
 
-        // Simulate AI execution
         let (output, compute_used) = self.simulate_ai_execution(&agent, &request.input_data, request.max_compute).await?;
         
         let execution_time = start_time.elapsed().as_millis() as u64;
         logs.push(format!("Execution completed in {}ms", execution_time));
         logs.push(format!("Compute units used: {}", compute_used));
 
-        // Update agent state
         {
             let mut agents = self.agents.write().unwrap();
             if let Some(agent_state) = agents.get_mut(&request.agent_id) {
@@ -168,7 +161,6 @@ impl AIRuntime {
             }
         }
 
-        // Cache result
         self.cache_execution(input_hash.clone(), output.clone(), compute_used);
 
         let execution_id = self.generate_execution_id(&request.agent_id, &input_hash);
@@ -183,20 +175,12 @@ impl AIRuntime {
         })
     }
 
-    /// Simulate AI execution (placeholder for actual inference)
     async fn simulate_ai_execution(
         &self,
         agent: &AIAgentState,
         input_data: &[u8],
         max_compute: u64,
     ) -> Result<(Vec<u8>, u64)> {
-        // In production, this would:
-        // 1. Load the model from IPFS using model_hash
-        // 2. Initialize inference runtime
-        // 3. Execute inference with compute metering
-        // 4. Return results
-        
-        // For now, simulate execution
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         
         let output = format!("AI output for input: {:?}", input_data.len()).into_bytes();
@@ -205,13 +189,11 @@ impl AIRuntime {
         Ok((output, compute_used))
     }
 
-    /// Get agent information
     pub fn get_agent_info(&self, agent_id: &[u8]) -> Option<AIAgentState> {
         let agents = self.agents.read().unwrap();
         agents.get(agent_id).cloned()
     }
 
-    /// Update agent configuration
     pub fn update_agent(
         &self,
         agent_id: &[u8],
@@ -223,7 +205,6 @@ impl AIRuntime {
         let agent = agents.get_mut(agent_id)
             .ok_or_else(|| anyhow::anyhow!("Agent not found"))?;
 
-        // Verify ownership
         if agent.owner != caller {
             return Err(anyhow::anyhow!("Unauthorized: not the owner"));
         }
@@ -234,38 +215,19 @@ impl AIRuntime {
         Ok(())
     }
 
-    /// Pause an agent
     pub fn pause_agent(&self, agent_id: &[u8], caller: &[u8]) -> Result<()> {
-        let mut agents = self.agents.write().unwrap();
-        
-        let agent = agents.get_mut(agent_id)
-            .ok_or_else(|| anyhow::anyhow!("Agent not found"))?;
-
-        if agent.owner != caller {
-            return Err(anyhow::anyhow!("Unauthorized"));
-        }
-
-        agent.status = AgentStatus::Paused;
-        Ok(())
+        self.update_agent_status(agent_id, caller, AgentStatus::Paused)
     }
 
-    /// Resume an agent
     pub fn resume_agent(&self, agent_id: &[u8], caller: &[u8]) -> Result<()> {
-        let mut agents = self.agents.write().unwrap();
-        
-        let agent = agents.get_mut(agent_id)
-            .ok_or_else(|| anyhow::anyhow!("Agent not found"))?;
-
-        if agent.owner != caller {
-            return Err(anyhow::anyhow!("Unauthorized"));
-        }
-
-        agent.status = AgentStatus::Active;
-        Ok(())
+        self.update_agent_status(agent_id, caller, AgentStatus::Active)
     }
 
-    /// Delete an agent
     pub fn delete_agent(&self, agent_id: &[u8], caller: &[u8]) -> Result<()> {
+        self.update_agent_status(agent_id, caller, AgentStatus::Deleted)
+    }
+
+    fn update_agent_status(&self, agent_id: &[u8], caller: &[u8], status: AgentStatus) -> Result<()> {
         let mut agents = self.agents.write().unwrap();
         
         let agent = agents.get_mut(agent_id)
@@ -275,11 +237,10 @@ impl AIRuntime {
             return Err(anyhow::anyhow!("Unauthorized"));
         }
 
-        agent.status = AgentStatus::Deleted;
+        agent.status = status;
         Ok(())
     }
 
-    /// List agents by owner
     pub fn list_agents_by_owner(&self, owner: &[u8]) -> Vec<AIAgentState> {
         let agents = self.agents.read().unwrap();
         
@@ -289,7 +250,6 @@ impl AIRuntime {
             .collect()
     }
 
-    /// Get all active agents
     pub fn get_active_agents(&self) -> Vec<AIAgentState> {
         let agents = self.agents.read().unwrap();
         
@@ -299,7 +259,6 @@ impl AIRuntime {
             .collect()
     }
 
-    /// Get runtime statistics
     pub fn get_stats(&self) -> RuntimeStats {
         let agents = self.agents.read().unwrap();
         
@@ -317,14 +276,6 @@ impl AIRuntime {
             total_compute_used: total_compute,
             cache_size: cache.len(),
         }
-    }
-
-    // Helper methods
-    fn hash_input(&self, data: &[u8]) -> Vec<u8> {
-        use sha2::{Sha256, Digest};
-        let mut hasher = Sha256::new();
-        hasher.update(data);
-        hasher.finalize().to_vec()
     }
 
     fn generate_execution_id(&self, agent_id: &[u8], input_hash: &[u8]) -> Vec<u8> {
@@ -345,9 +296,7 @@ impl AIRuntime {
     fn cache_execution(&self, input_hash: Vec<u8>, output: Vec<u8>, compute_used: u64) {
         let mut cache = self.execution_cache.write().unwrap();
         
-        // Keep cache size bounded
         if cache.len() >= 1000 {
-            // Remove oldest entries
             let oldest_keys: Vec<_> = cache.iter()
                 .take(100)
                 .map(|(k, _)| k.clone())
@@ -374,13 +323,6 @@ pub struct RuntimeStats {
     pub total_executions: u64,
     pub total_compute_used: u64,
     pub cache_size: usize,
-}
-
-fn current_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
 }
 
 #[cfg(test)]
@@ -468,10 +410,7 @@ mod tests {
             caller: owner.clone(),
         };
         
-        // First execution
         let result1 = runtime.execute_agent(request.clone()).await.unwrap();
-        
-        // Second execution (should use cache)
         let result2 = runtime.execute_agent(request).await.unwrap();
         
         assert_eq!(result1.output_data, result2.output_data);
@@ -487,12 +426,10 @@ mod tests {
         
         runtime.deploy_agent(agent_id.clone(), vec![2u8; 32], owner.clone(), config).unwrap();
         
-        // Pause
         runtime.pause_agent(&agent_id, &owner).unwrap();
         let info = runtime.get_agent_info(&agent_id).unwrap();
         assert_eq!(info.status, AgentStatus::Paused);
         
-        // Resume
         runtime.resume_agent(&agent_id, &owner).unwrap();
         let info = runtime.get_agent_info(&agent_id).unwrap();
         assert_eq!(info.status, AgentStatus::Active);
@@ -527,5 +464,3 @@ mod tests {
         assert_eq!(agents.len(), 2);
     }
 }
-
-
