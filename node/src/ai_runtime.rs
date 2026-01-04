@@ -2,7 +2,7 @@ use anyhow::{Result, Context};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use serde::{Serialize, Deserialize};
-use tracing::{info, warn, debug};
+use tracing::{info, warn, debug, error};
 use ndarray::{ArrayD, IxDyn};
 
 use crate::utils::{current_timestamp, hash_data, to_base58};
@@ -306,27 +306,31 @@ impl AIRuntime {
             return Err(anyhow::anyhow!("Compute budget exceeded during input processing"));
         }
 
-        // 3. Try to load the actual model from cache
-        let model_result = self.load_model_by_hash(&agent.model_hash);
+        // 3. Load the actual model from cache - REQUIRED, no fallback
+        let model = self.load_model_by_hash(&agent.model_hash)
+            .map_err(|e| {
+                error!(
+                    "Model not found for agent {}: {}. Model hash: {}",
+                    to_base58(&agent.agent_id),
+                    e,
+                    to_base58(&agent.model_hash)
+                );
+                anyhow::anyhow!(
+                    "ModelNotFound: Cannot execute agent without model. \
+                    Model hash '{}' not found in storage path '{}'. \
+                    Please ensure the model is uploaded before executing the agent.",
+                    to_base58(&agent.model_hash),
+                    self.model_storage_path
+                )
+            })?;
         
-        // 4. Execute based on model availability and type
-        let (output, execution_cost) = match model_result {
-            Ok(model) => {
-                // Real model inference
-                self.execute_with_real_model(&model, input_data, &agent.config, max_compute - compute_used).await?
-            }
-            Err(e) => {
-                // Fallback to simulated execution if model not found
-                debug!("Model not found ({}), using simulated execution", e);
-                match agent.config.model_type.as_str() {
-                    "transformer" => self.execute_transformer_simulated(input_data, &agent.config).await?,
-                    "cnn" => self.execute_cnn_simulated(input_data, &agent.config).await?,
-                    "rnn" => self.execute_rnn_simulated(input_data, &agent.config).await?,
-                    "embeddings" => self.execute_embeddings_simulated(input_data, &agent.config).await?,
-                    _ => self.execute_generic_simulated(input_data, &agent.config).await?,
-                }
-            }
-        };
+        // 4. Execute using the REAL model - no simulation fallback
+        let (output, execution_cost) = self.execute_with_real_model(
+            &model, 
+            input_data, 
+            &agent.config, 
+            max_compute - compute_used
+        ).await?;
 
         compute_used += execution_cost;
         
