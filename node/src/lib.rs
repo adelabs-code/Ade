@@ -17,6 +17,7 @@ pub mod protocol;
 pub mod snapshot;
 pub mod metrics;
 pub mod performance;
+pub mod compression;
 pub mod utils;
 pub mod errors;
 
@@ -35,7 +36,8 @@ pub use fee_market::{FeeMarket, FeeMarketConfig, BlockFeeData, FeeEstimate, FeeM
 pub use block_producer::{BlockProducer, ProducerConfig, BlockProductionResult, ProducerStats};
 pub use state_transition::{StateTransition, TransitionResult, AccountChange};
 pub use transport::Transport;
-pub use protocol::{Protocol, MessageHeader, MessageType, Compression};
+pub use protocol::{Protocol, MessageHeader, MessageType};
+pub use compression::{Compressor, CompressionAlgorithm, AdaptiveCompressor};
 pub use snapshot::{SnapshotManager, SnapshotMetadata, SnapshotManifest};
 pub use metrics::{MetricsCollector, MetricsSnapshot, HistogramStats};
 pub use performance::{PerformanceTracker, PerformanceSample, PerformanceReport};
