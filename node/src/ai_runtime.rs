@@ -23,6 +23,15 @@ pub struct AIRuntime {
     onnx_inference: Arc<OnnxInference>,
     /// Model storage path for loading models by hash
     model_storage_path: String,
+    /// Cache statistics for hit rate calculation
+    cache_stats: Arc<RwLock<CacheStats>>,
+}
+
+/// Statistics for cache hit rate calculation
+#[derive(Debug, Clone, Default)]
+struct CacheStats {
+    hits: u64,
+    misses: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +116,7 @@ impl AIRuntime {
             model_cache: Arc::new(ModelCache::new(100)), // Cache up to 100 models
             onnx_inference: Arc::new(onnx_inference),
             model_storage_path,
+            cache_stats: Arc::new(RwLock::new(CacheStats::default())),
         }
     }
 
@@ -204,18 +214,25 @@ impl AIRuntime {
 
         let input_hash = hash_data(&request.input_data);
         
-        // Check cache
+        // Check cache for existing execution result
         if let Some(cached) = self.get_cached_execution(&input_hash) {
-            info!("Using cached execution result");
+            self.record_cache_hit();
+            info!("Cache HIT - Using cached execution result");
             return Ok(ExecutionResult {
                 execution_id: self.generate_execution_id(&request.agent_id, &input_hash),
                 output_data: cached.output,
                 compute_units_used: cached.compute_used,
-                logs: vec!["Using cached result".to_string()],
+                logs: vec![
+                    "Cache HIT: Using cached result".to_string(),
+                    format!("Cache hit rate: {:.2}%", self.calculate_cache_hit_rate() * 100.0),
+                ],
                 success: true,
                 error: None,
             });
         }
+        
+        // Cache miss - will need to execute
+        self.record_cache_miss();
 
         let start_time = std::time::Instant::now();
         let mut logs = Vec::new();
@@ -647,14 +664,35 @@ impl AIRuntime {
         }
     }
 
+    /// Calculate the cache hit rate based on actual cache statistics
     fn calculate_cache_hit_rate(&self) -> f64 {
-        let history = self.execution_history.read().unwrap();
-        if history.is_empty() {
+        let stats = self.cache_stats.read().unwrap();
+        let total = stats.hits + stats.misses;
+        
+        if total == 0 {
             return 0.0;
         }
-
-        // In production, track cache hits separately
-        0.0
+        
+        (stats.hits as f64) / (total as f64)
+    }
+    
+    /// Record a cache hit
+    fn record_cache_hit(&self) {
+        let mut stats = self.cache_stats.write().unwrap();
+        stats.hits += 1;
+    }
+    
+    /// Record a cache miss
+    fn record_cache_miss(&self) {
+        let mut stats = self.cache_stats.write().unwrap();
+        stats.misses += 1;
+    }
+    
+    /// Reset cache statistics
+    pub fn reset_cache_stats(&self) {
+        let mut stats = self.cache_stats.write().unwrap();
+        stats.hits = 0;
+        stats.misses = 0;
     }
 
     fn generate_execution_id(&self, agent_id: &[u8], input_hash: &[u8]) -> Vec<u8> {

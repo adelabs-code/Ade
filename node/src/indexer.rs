@@ -5,6 +5,33 @@ use serde::{Serialize, Deserialize};
 
 use crate::storage::Storage;
 
+/// Stored block format for deserialization during index rebuild
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredBlock {
+    slot: u64,
+    transaction_signatures: Vec<Vec<u8>>,
+    blockhash: Vec<u8>,
+    parent_slot: u64,
+    timestamp: u64,
+}
+
+/// Stored transaction format for deserialization during index rebuild
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredTransaction {
+    signature: Vec<u8>,
+    slot: u64,
+    account_keys: Vec<Vec<u8>>,
+    data: Vec<u8>,
+}
+
+/// Stored account format for deserialization during index rebuild
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredAccount {
+    owner: Vec<u8>,
+    lamports: u64,
+    data: Vec<u8>,
+}
+
 /// Secondary index for efficient queries
 pub struct SecondaryIndex {
     storage: Arc<Storage>,
@@ -118,10 +145,69 @@ impl SecondaryIndex {
         index.get(address).map(|v| v.len()).unwrap_or(0)
     }
 
-    /// Rebuild index from storage
+    /// Rebuild all indexes by scanning the entire storage database
+    /// This is used for recovery or when indexes become corrupted
     pub fn rebuild_from_storage(&self) -> Result<()> {
-        // In production, this would scan the entire database
-        // and rebuild all indexes
+        use tracing::{info, warn};
+        
+        info!("Starting index rebuild from storage...");
+        
+        let start_time = std::time::Instant::now();
+        let mut total_indexed = 0usize;
+        
+        // Clear existing in-memory indexes
+        {
+            let mut addr_index = self.address_to_transactions.write().unwrap();
+            addr_index.clear();
+        }
+        {
+            let mut prog_index = self.program_to_accounts.write().unwrap();
+            prog_index.clear();
+        }
+        {
+            let mut slot_index = self.slot_to_transactions.write().unwrap();
+            slot_index.clear();
+        }
+        
+        // Rebuild transaction index by scanning all transactions
+        // Get blocks from storage and extract transaction data
+        let blocks = self.storage.get_blocks_range(0, u64::MAX)?;
+        
+        for (slot, block_data) in blocks {
+            // Try to deserialize block to get transactions
+            if let Ok(block) = bincode::deserialize::<StoredBlock>(&block_data) {
+                for tx_sig in &block.transaction_signatures {
+                    // Index transaction by slot
+                    self.index_transaction_by_slot(slot, tx_sig)?;
+                    
+                    // Get transaction data to extract account keys
+                    if let Ok(Some(tx_data)) = self.storage.get_transaction(tx_sig) {
+                        if let Ok(tx_info) = bincode::deserialize::<StoredTransaction>(&tx_data) {
+                            // Index by each involved account
+                            for account_key in &tx_info.account_keys {
+                                self.index_transaction_by_address(account_key, tx_sig)?;
+                            }
+                            total_indexed += 1;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Rebuild program account index
+        let accounts = self.storage.get_all_accounts()?;
+        
+        for (address, account_data) in accounts {
+            if let Ok(account_info) = bincode::deserialize::<StoredAccount>(&account_data) {
+                // Index account by program (owner)
+                self.index_account_by_program(&account_info.owner, &address)?;
+                total_indexed += 1;
+            }
+        }
+        
+        let elapsed = start_time.elapsed();
+        info!("Index rebuild complete: {} items indexed in {:?}", total_indexed, elapsed);
+        
         Ok(())
     }
 

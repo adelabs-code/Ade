@@ -204,6 +204,22 @@ impl Storage {
         Ok(())
     }
 
+    /// Get all accounts from storage
+    pub fn get_all_accounts(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let cf = self.db.cf_handle(CF_ACCOUNTS)
+            .context("Accounts CF not found")?;
+        
+        let mut accounts = Vec::new();
+        let iter = self.db.iterator_cf(cf, IteratorMode::Start);
+        
+        for item in iter {
+            let (key, value) = item?;
+            accounts.push((key.to_vec(), value.to_vec()));
+        }
+        
+        Ok(accounts)
+    }
+
     /// Get accounts by program
     pub fn get_accounts_by_program(&self, program_id: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let cf = self.db.cf_handle(CF_PROGRAM_ACCOUNTS)
@@ -307,15 +323,138 @@ impl Storage {
         })
     }
 
-    /// Create backup (placeholder)
+    /// Create a backup of the database to the specified path
     pub fn backup(&self, backup_path: &str) -> Result<()> {
+        use std::fs;
+        use std::io::Write;
+        
         info!("Creating backup at {}", backup_path);
+        
+        // Create backup directory
+        let backup_dir = std::path::Path::new(backup_path);
+        fs::create_dir_all(backup_dir)?;
+        
+        // Export all column families
+        let cf_names = [CF_BLOCKS, CF_TRANSACTIONS, CF_ACCOUNTS, CF_STATE, CF_SLOTS, CF_SIGNATURES, CF_PROGRAM_ACCOUNTS];
+        
+        let mut total_entries = 0usize;
+        
+        for cf_name in &cf_names {
+            if let Some(cf) = self.db.cf_handle(cf_name) {
+                let cf_backup_path = backup_dir.join(format!("{}.dat", cf_name));
+                let mut file = fs::File::create(&cf_backup_path)?;
+                
+                let iter = self.db.iterator_cf(cf, IteratorMode::Start);
+                let mut entry_count = 0usize;
+                
+                for item in iter {
+                    let (key, value) = item?;
+                    
+                    // Write key length (8 bytes), key, value length (8 bytes), value
+                    file.write_all(&(key.len() as u64).to_le_bytes())?;
+                    file.write_all(&key)?;
+                    file.write_all(&(value.len() as u64).to_le_bytes())?;
+                    file.write_all(&value)?;
+                    
+                    entry_count += 1;
+                }
+                
+                total_entries += entry_count;
+                info!("Backed up {} entries from {}", entry_count, cf_name);
+            }
+        }
+        
+        // Write metadata
+        let metadata = serde_json::json!({
+            "timestamp": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            "total_entries": total_entries,
+            "column_families": cf_names,
+        });
+        
+        let metadata_path = backup_dir.join("metadata.json");
+        fs::write(&metadata_path, serde_json::to_string_pretty(&metadata)?)?;
+        
+        info!("Backup complete: {} total entries", total_entries);
         Ok(())
     }
 
-    /// Restore from backup (placeholder)
+    /// Restore database from a backup at the specified path
     pub fn restore_from_backup(&self, backup_path: &str) -> Result<()> {
+        use std::fs;
+        use std::io::Read;
+        
         info!("Restoring from backup at {}", backup_path);
+        
+        let backup_dir = std::path::Path::new(backup_path);
+        
+        // Verify backup exists
+        if !backup_dir.exists() {
+            return Err(anyhow::anyhow!("Backup path does not exist: {}", backup_path));
+        }
+        
+        // Read and verify metadata
+        let metadata_path = backup_dir.join("metadata.json");
+        if !metadata_path.exists() {
+            return Err(anyhow::anyhow!("Invalid backup: metadata.json not found"));
+        }
+        
+        let metadata_str = fs::read_to_string(&metadata_path)?;
+        let metadata: serde_json::Value = serde_json::from_str(&metadata_str)?;
+        
+        info!("Restoring backup from timestamp: {}", 
+            metadata.get("timestamp").and_then(|t| t.as_u64()).unwrap_or(0));
+        
+        // Restore each column family
+        let cf_names = [CF_BLOCKS, CF_TRANSACTIONS, CF_ACCOUNTS, CF_STATE, CF_SLOTS, CF_SIGNATURES, CF_PROGRAM_ACCOUNTS];
+        let mut total_restored = 0usize;
+        
+        for cf_name in &cf_names {
+            let cf_backup_path = backup_dir.join(format!("{}.dat", cf_name));
+            
+            if !cf_backup_path.exists() {
+                warn!("Column family backup not found: {}", cf_name);
+                continue;
+            }
+            
+            if let Some(cf) = self.db.cf_handle(cf_name) {
+                let mut file = fs::File::open(&cf_backup_path)?;
+                let mut entry_count = 0usize;
+                
+                loop {
+                    // Read key length
+                    let mut key_len_buf = [0u8; 8];
+                    if file.read_exact(&mut key_len_buf).is_err() {
+                        break; // End of file
+                    }
+                    let key_len = u64::from_le_bytes(key_len_buf) as usize;
+                    
+                    // Read key
+                    let mut key = vec![0u8; key_len];
+                    file.read_exact(&mut key)?;
+                    
+                    // Read value length
+                    let mut value_len_buf = [0u8; 8];
+                    file.read_exact(&mut value_len_buf)?;
+                    let value_len = u64::from_le_bytes(value_len_buf) as usize;
+                    
+                    // Read value
+                    let mut value = vec![0u8; value_len];
+                    file.read_exact(&mut value)?;
+                    
+                    // Write to database
+                    self.db.put_cf(cf, &key, &value)?;
+                    entry_count += 1;
+                }
+                
+                total_restored += entry_count;
+                info!("Restored {} entries to {}", entry_count, cf_name);
+            }
+        }
+        
+        info!("Restore complete: {} total entries", total_restored);
         Ok(())
     }
 
