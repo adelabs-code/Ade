@@ -342,6 +342,12 @@ impl InstructionExecutor {
     }
 
     /// Execute bridge deposit instruction - mints wrapped tokens to recipient
+    /// 
+    /// This function:
+    /// 1. Creates or updates the wrapped token mint for the bridged asset
+    /// 2. Creates or updates the recipient's token account
+    /// 3. Mints wrapped tokens to the recipient
+    /// 4. Records the deposit for relayer verification
     fn execute_bridge_deposit(
         &self,
         from_chain: &str,
@@ -370,31 +376,86 @@ impl InstructionExecutor {
         let mut accounts_map = self.accounts.write().unwrap();
         let mut modified_accounts = Vec::new();
 
-        // Get or create the wrapped token account for the recipient
-        // The wrapped token account key is derived from token_address and recipient
-        let wrapped_token_key = self.derive_wrapped_token_key(token_address, recipient_key);
+        // 1. Get or create wrapped token mint account
+        let wrapped_mint_key = self.derive_wrapped_mint_key(from_chain, token_address);
+        let wrapped_mint = accounts_map.entry(wrapped_mint_key.clone())
+            .or_insert_with(|| {
+                let mut account = Account::new(0, vec![]);
+                // Initialize mint data
+                let mint_data = MintAccountData {
+                    mint_authority: Some(self.derive_bridge_authority_key().to_vec()),
+                    supply: 0,
+                    decimals: 9, // Default decimals
+                    is_initialized: true,
+                    freeze_authority: Some(self.derive_bridge_authority_key().to_vec()),
+                };
+                account.data = bincode::serialize(&mint_data).unwrap_or_default();
+                account
+            });
         
-        // Create bridge escrow account if needed (holds the proof of deposit)
-        let bridge_escrow_key = self.derive_bridge_escrow_key(from_chain);
+        // Update mint supply
+        if let Ok(mut mint_data) = bincode::deserialize::<MintAccountData>(&wrapped_mint.data) {
+            mint_data.supply = mint_data.supply.saturating_add(amount);
+            wrapped_mint.data = bincode::serialize(&mint_data)?;
+            modified_accounts.push(wrapped_mint_key.clone());
+            context.log(format!("Updated mint supply: {}", mint_data.supply));
+        }
+
+        // 2. Get or create recipient's token account for this wrapped token
+        let recipient_token_key = self.derive_wrapped_token_key(token_address, recipient_key);
+        let recipient_token_account = accounts_map.entry(recipient_token_key.clone())
+            .or_insert_with(|| {
+                let mut account = Account::new(0, vec![]);
+                let token_data = TokenAccountData::new(
+                    wrapped_mint_key.clone(),
+                    recipient_key.clone(),
+                );
+                account.data = bincode::serialize(&token_data).unwrap_or_default();
+                account.owner = wrapped_mint_key.clone(); // Token program owns the account
+                account
+            });
         
-        // Get or create recipient's wrapped token account
+        // 3. Update token account balance (mint tokens)
+        if let Ok(mut token_data) = bincode::deserialize::<TokenAccountData>(&recipient_token_account.data) {
+            // Check if account is frozen
+            if token_data.is_frozen() {
+                return Err(anyhow::anyhow!("Recipient token account is frozen"));
+            }
+            
+            // Verify ownership
+            if token_data.owner != *recipient_key {
+                return Err(anyhow::anyhow!("Token account owner mismatch"));
+            }
+            
+            // Mint tokens
+            token_data.amount = token_data.amount.saturating_add(amount);
+            recipient_token_account.data = bincode::serialize(&token_data)?;
+            modified_accounts.push(recipient_token_key.clone());
+            
+            context.log(format!("Minted {} wrapped tokens to token account", amount));
+            context.log(format!("New token balance: {}", token_data.amount));
+        } else {
+            // Fallback: create new token data
+            let token_data = TokenAccountData::with_amount(
+                wrapped_mint_key.clone(),
+                recipient_key.clone(),
+                amount,
+            );
+            recipient_token_account.data = bincode::serialize(&token_data)?;
+            modified_accounts.push(recipient_token_key.clone());
+            context.log(format!("Created new token account with {} tokens", amount));
+        }
+
+        // 4. Also credit lamports for gas (optional: bridge fee could cover this)
         let recipient_account = accounts_map.entry(recipient_key.clone())
             .or_insert_with(|| Account::new(0, vec![]));
-        
-        // Mint wrapped tokens by increasing lamports (representing wrapped token balance)
-        // In production, this would update a token account's data field
-        recipient_account.lamports += amount;
         modified_accounts.push(recipient_key.clone());
-        
-        context.log(format!("Minted {} wrapped tokens to recipient", amount));
-        context.log(format!("New recipient balance: {}", recipient_account.lamports));
 
-        // Update or create bridge deposit record
+        // 5. Record the deposit
         let deposit_record_key = self.derive_deposit_record_key(token_address, context.slot);
         let deposit_record = accounts_map.entry(deposit_record_key.clone())
             .or_insert_with(|| Account::new(0, vec![]));
         
-        // Store deposit metadata in account data
         deposit_record.data = bincode::serialize(&BridgeDepositRecord {
             from_chain: from_chain.to_string(),
             token_address: token_address.to_vec(),
@@ -420,6 +481,12 @@ impl InstructionExecutor {
     }
 
     /// Execute bridge withdraw instruction - burns wrapped tokens and initiates unlock
+    /// 
+    /// This function:
+    /// 1. Validates the sender's token account
+    /// 2. Burns wrapped tokens from the sender's token account
+    /// 3. Updates the mint supply
+    /// 4. Creates a withdrawal record for the relayer
     fn execute_bridge_withdraw(
         &self,
         to_chain: &str,
@@ -428,8 +495,8 @@ impl InstructionExecutor {
         accounts: &[AccountMeta],
         context: &mut ExecutionContext,
     ) -> Result<ExecutionResult> {
-        if accounts.is_empty() {
-            return Err(anyhow::anyhow!("No accounts provided for bridge withdrawal"));
+        if accounts.len() < 2 {
+            return Err(anyhow::anyhow!("Insufficient accounts: need sender and token account"));
         }
 
         // Validate amount
@@ -438,6 +505,12 @@ impl InstructionExecutor {
         }
 
         let sender_key = &accounts[0].pubkey;
+        let token_account_key = if accounts.len() > 1 { 
+            &accounts[1].pubkey 
+        } else { 
+            sender_key 
+        };
+        
         context.log(format!(
             "Bridge withdraw to {} of {} tokens from {}",
             to_chain,
@@ -448,27 +521,68 @@ impl InstructionExecutor {
         let mut accounts_map = self.accounts.write().unwrap();
         let mut modified_accounts = Vec::new();
 
-        // Get sender's account
-        let sender_account = accounts_map.get_mut(sender_key)
-            .ok_or_else(|| anyhow::anyhow!("Sender account not found"))?;
+        // 1. Get and validate the sender's token account
+        let sender_token_account = accounts_map.get_mut(token_account_key)
+            .ok_or_else(|| anyhow::anyhow!("Sender token account not found"))?;
 
-        // Check sender has sufficient balance
-        if sender_account.lamports < amount {
-            return Err(anyhow::anyhow!(
-                "Insufficient balance for withdrawal: {} < {}",
-                sender_account.lamports,
-                amount
-            ));
+        // Try to parse as TokenAccountData
+        if let Ok(mut token_data) = bincode::deserialize::<TokenAccountData>(&sender_token_account.data) {
+            // Verify ownership
+            if token_data.owner != *sender_key {
+                return Err(anyhow::anyhow!("Token account owner mismatch"));
+            }
+            
+            // Check if account is frozen
+            if token_data.is_frozen() {
+                return Err(anyhow::anyhow!("Token account is frozen"));
+            }
+            
+            // Check sufficient balance
+            if token_data.amount < amount {
+                return Err(anyhow::anyhow!(
+                    "Insufficient token balance: {} < {}",
+                    token_data.amount,
+                    amount
+                ));
+            }
+            
+            // 2. Burn tokens from account
+            token_data.amount = token_data.amount.saturating_sub(amount);
+            sender_token_account.data = bincode::serialize(&token_data)?;
+            modified_accounts.push(token_account_key.clone());
+            
+            context.log(format!("Burned {} tokens from token account", amount));
+            context.log(format!("Remaining token balance: {}", token_data.amount));
+            
+            // 3. Update mint supply (decrease by burned amount)
+            if let Some(mint_account) = accounts_map.get_mut(&token_data.mint) {
+                if let Ok(mut mint_data) = bincode::deserialize::<MintAccountData>(&mint_account.data) {
+                    mint_data.supply = mint_data.supply.saturating_sub(amount);
+                    mint_account.data = bincode::serialize(&mint_data)?;
+                    modified_accounts.push(token_data.mint.clone());
+                    context.log(format!("Updated mint supply: {}", mint_data.supply));
+                }
+            }
+        } else {
+            // Fallback: treat as lamports (legacy behavior)
+            let sender_account = accounts_map.get_mut(sender_key)
+                .ok_or_else(|| anyhow::anyhow!("Sender account not found"))?;
+
+            if sender_account.lamports < amount {
+                return Err(anyhow::anyhow!(
+                    "Insufficient balance for withdrawal: {} < {}",
+                    sender_account.lamports,
+                    amount
+                ));
+            }
+
+            sender_account.lamports -= amount;
+            modified_accounts.push(sender_key.clone());
+            
+            context.log(format!("Burned {} lamports from sender (legacy mode)", amount));
         }
 
-        // Burn wrapped tokens by deducting from sender's balance
-        sender_account.lamports -= amount;
-        modified_accounts.push(sender_key.clone());
-        
-        context.log(format!("Burned {} wrapped tokens from sender", amount));
-        context.log(format!("Sender remaining balance: {}", sender_account.lamports));
-
-        // Create withdrawal record for the relayer to process
+        // 4. Create withdrawal record for the relayer to process
         let withdrawal_record_key = self.derive_withdrawal_record_key(sender_key, context.slot);
         let mut withdrawal_record = Account::new(0, vec![]);
         
@@ -489,7 +603,7 @@ impl InstructionExecutor {
         modified_accounts.push(withdrawal_record_key);
 
         context.log(format!(
-            "Withdrawal initiated to {} on {}",
+            "Withdrawal record created for {} on {}",
             bs58::encode(recipient).into_string(),
             to_chain
         ));
@@ -541,6 +655,25 @@ impl InstructionExecutor {
         hasher.update(&slot.to_le_bytes());
         hasher.finalize().to_vec()
     }
+
+    /// Derive wrapped token mint key for a specific chain and token
+    fn derive_wrapped_mint_key(&self, from_chain: &str, token_address: &[u8]) -> Vec<u8> {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(b"wrapped_mint");
+        hasher.update(from_chain.as_bytes());
+        hasher.update(token_address);
+        hasher.finalize().to_vec()
+    }
+
+    /// Derive the bridge authority key (PDA-like)
+    fn derive_bridge_authority_key(&self) -> Vec<u8> {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(b"bridge_authority");
+        hasher.update(b"ADE_BRIDGE_PROGRAM");
+        hasher.finalize().to_vec()
+    }
 }
 
 /// Record of a bridge deposit
@@ -552,6 +685,81 @@ pub struct BridgeDepositRecord {
     pub recipient: Vec<u8>,
     pub slot: u64,
     pub timestamp: u64,
+}
+
+/// SPL Token Account structure for proper token handling
+/// This mirrors the Solana SPL Token program's account layout
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TokenAccountData {
+    /// The mint/token address this account holds
+    pub mint: Vec<u8>,
+    /// Owner of this token account
+    pub owner: Vec<u8>,
+    /// Token balance
+    pub amount: u64,
+    /// Optional delegate
+    pub delegate: Option<Vec<u8>>,
+    /// Account state (0=uninitialized, 1=initialized, 2=frozen)
+    pub state: u8,
+    /// Is this a native token account (SOL)?
+    pub is_native: bool,
+    /// Delegated amount
+    pub delegated_amount: u64,
+    /// Optional close authority
+    pub close_authority: Option<Vec<u8>>,
+}
+
+impl TokenAccountData {
+    /// Create a new token account
+    pub fn new(mint: Vec<u8>, owner: Vec<u8>) -> Self {
+        Self {
+            mint,
+            owner,
+            amount: 0,
+            delegate: None,
+            state: 1, // Initialized
+            is_native: false,
+            delegated_amount: 0,
+            close_authority: None,
+        }
+    }
+    
+    /// Create a new token account with initial amount
+    pub fn with_amount(mint: Vec<u8>, owner: Vec<u8>, amount: u64) -> Self {
+        let mut account = Self::new(mint, owner);
+        account.amount = amount;
+        account
+    }
+    
+    /// Check if account is frozen
+    pub fn is_frozen(&self) -> bool {
+        self.state == 2
+    }
+    
+    /// Freeze the account
+    pub fn freeze(&mut self) {
+        self.state = 2;
+    }
+    
+    /// Unfreeze the account
+    pub fn unfreeze(&mut self) {
+        self.state = 1;
+    }
+}
+
+/// Mint account structure for token minting authority
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MintAccountData {
+    /// Mint authority (can mint new tokens)
+    pub mint_authority: Option<Vec<u8>>,
+    /// Total supply
+    pub supply: u64,
+    /// Number of decimals
+    pub decimals: u8,
+    /// Is initialized
+    pub is_initialized: bool,
+    /// Freeze authority (can freeze accounts)
+    pub freeze_authority: Option<Vec<u8>>,
 }
 
 /// Record of a bridge withdrawal
