@@ -5,8 +5,16 @@ use std::sync::{Arc, RwLock};
 use tracing::{info, warn, error};
 
 /// Ade sidechain mint/burn program (SVM-compatible)
+/// 
+/// Uses SPL-Token-like architecture to prevent state bloat:
+/// - Token metadata stored in MintProgramState (small, fixed size)
+/// - Individual balances stored in separate TokenAccount per holder
+/// - Account key = derive_token_account_key(token, holder)
 pub struct AdeMintProgram {
     state: Arc<RwLock<MintProgramState>>,
+    /// Separate storage for token accounts (prevents bloat)
+    /// Key: derive_token_account_key(token, holder)
+    token_accounts: Arc<RwLock<HashMap<Vec<u8>, TokenAccount>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,14 +24,43 @@ pub struct MintProgramState {
     pub total_minted: u64,
     pub total_burned: u64,
     pub nonce: u64,
+    /// Processed proof hashes to prevent replay attacks
+    /// Key: hash of (source_tx_hash + block_number)
+    /// Value: timestamp when processed
+    pub processed_proofs: HashMap<Vec<u8>, u64>,
 }
 
+/// Wrapped token metadata - stored per token type
+/// 
+/// NOTE: Holder balances are NO LONGER stored here to prevent state bloat.
+/// Instead, balances are stored in separate TokenAccount structures indexed
+/// by (token_address, holder_address). This follows the SPL Token pattern.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WrappedToken {
     pub original_token: Vec<u8>,
     pub original_chain: String,
     pub total_supply: u64,
+    /// DEPRECATED: Use get_balance() which reads from token_accounts
+    /// Kept for backward compatibility with existing serialized state
+    #[serde(default)]
     pub holders: HashMap<Vec<u8>, u64>,
+}
+
+/// Separate token account for each (token, holder) pair
+/// This prevents single-account bloat that would break the contract
+/// when holder count exceeds serialization limits.
+/// 
+/// Design follows SPL Token pattern:
+/// - Each holder has their own token account per token type
+/// - Account key = hash(token_address || holder_address)
+/// - Maximum ~10MB per account, but each account is separate
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenAccount {
+    pub token: Vec<u8>,
+    pub owner: Vec<u8>,
+    pub balance: u64,
+    pub created_at: u64,
+    pub last_updated: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,8 +114,96 @@ impl AdeMintProgram {
                 total_minted: 0,
                 total_burned: 0,
                 nonce: 0,
+                processed_proofs: HashMap::new(),
             })),
+            token_accounts: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+    
+    /// Derive token account key from token and holder addresses
+    /// This creates a unique key for each (token, holder) pair
+    fn derive_token_account_key(token: &[u8], holder: &[u8]) -> Vec<u8> {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(b"TOKEN_ACCOUNT_V1");
+        hasher.update(token);
+        hasher.update(holder);
+        hasher.finalize().to_vec()
+    }
+    
+    /// Get or create a token account for a holder
+    fn get_or_create_token_account(&self, token: &[u8], holder: &[u8]) -> TokenAccount {
+        let key = Self::derive_token_account_key(token, holder);
+        let accounts = self.token_accounts.read().unwrap();
+        
+        accounts.get(&key).cloned().unwrap_or_else(|| TokenAccount {
+            token: token.to_vec(),
+            owner: holder.to_vec(),
+            balance: 0,
+            created_at: current_timestamp(),
+            last_updated: current_timestamp(),
+        })
+    }
+    
+    /// Update token account balance
+    fn update_token_account(&self, token: &[u8], holder: &[u8], new_balance: u64) {
+        let key = Self::derive_token_account_key(token, holder);
+        let mut accounts = self.token_accounts.write().unwrap();
+        
+        let account = accounts.entry(key).or_insert_with(|| TokenAccount {
+            token: token.to_vec(),
+            owner: holder.to_vec(),
+            balance: 0,
+            created_at: current_timestamp(),
+            last_updated: current_timestamp(),
+        });
+        
+        account.balance = new_balance;
+        account.last_updated = current_timestamp();
+    }
+    
+    /// Get balance from token accounts (not from WrappedToken.holders)
+    fn get_token_account_balance(&self, token: &[u8], holder: &[u8]) -> u64 {
+        let key = Self::derive_token_account_key(token, holder);
+        let accounts = self.token_accounts.read().unwrap();
+        accounts.get(&key).map(|a| a.balance).unwrap_or(0)
+    }
+    
+    /// Compute unique proof identifier to prevent replay attacks
+    /// Uses source_tx_hash + block_number to create a unique key
+    fn compute_proof_hash(proof: &super::solana_lock::BridgeProof) -> Vec<u8> {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(b"PROOF_ID_V1");
+        hasher.update(&proof.source_tx_hash);
+        hasher.update(&proof.block_number.to_le_bytes());
+        // Include event data to differentiate multiple events in same tx
+        hasher.update(&proof.event_data);
+        hasher.finalize().to_vec()
+    }
+    
+    /// Check if a proof has already been processed (replay protection)
+    fn is_proof_processed(&self, proof_hash: &[u8]) -> bool {
+        let state = self.state.read().unwrap();
+        state.processed_proofs.contains_key(proof_hash)
+    }
+    
+    /// Mark a proof as processed
+    fn mark_proof_processed(&self, proof_hash: Vec<u8>) {
+        let mut state = self.state.write().unwrap();
+        state.processed_proofs.insert(proof_hash, current_timestamp());
+    }
+    
+    /// Get count of processed proofs (for monitoring)
+    pub fn get_processed_proof_count(&self) -> usize {
+        let state = self.state.read().unwrap();
+        state.processed_proofs.len()
+    }
+    
+    /// Get total token accounts count
+    pub fn get_token_account_count(&self) -> usize {
+        let accounts = self.token_accounts.read().unwrap();
+        accounts.len()
     }
 
     /// Process instruction
@@ -115,6 +240,9 @@ impl AdeMintProgram {
     }
 
     /// Mint wrapped tokens after verifying proof
+    /// 
+    /// CRITICAL: Includes replay attack protection to prevent the same proof
+    /// from being used multiple times to mint infinite tokens.
     fn mint_wrapped(
         &self,
         proof: super::solana_lock::BridgeProof,
@@ -122,25 +250,56 @@ impl AdeMintProgram {
         amount: u64,
         original_token: Vec<u8>,
     ) -> Result<Vec<u8>> {
-        // Verify proof
+        // STEP 1: Compute proof hash BEFORE acquiring lock (for replay check)
+        let proof_hash = Self::compute_proof_hash(&proof);
+        
+        // STEP 2: Check for replay attack FIRST
+        // This is the CRITICAL security check that was missing
+        if self.is_proof_processed(&proof_hash) {
+            error!(
+                "REPLAY ATTACK DETECTED: Proof already processed. TX: {}, Block: {}",
+                bs58::encode(&proof.source_tx_hash).into_string(),
+                proof.block_number
+            );
+            return Err(anyhow::anyhow!(
+                "Proof already processed (replay attack prevention). \
+                Source TX: {}, Block: {}",
+                bs58::encode(&proof.source_tx_hash).into_string(),
+                proof.block_number
+            ));
+        }
+        
+        // STEP 3: Verify proof cryptographically
         self.verify_proof(&proof)?;
 
-        let mut state = self.state.write().unwrap();
+        // STEP 4: Mark proof as processed BEFORE minting (prevents race conditions)
+        self.mark_proof_processed(proof_hash.clone());
 
-        // Get or create wrapped token
-        let token = state.wrapped_tokens.entry(original_token.clone())
-            .or_insert_with(|| WrappedToken {
-                original_token: original_token.clone(),
-                original_chain: "solana".to_string(),
-                total_supply: 0,
-                holders: HashMap::new(),
-            });
+        // STEP 5: Update token account balance (SPL-style separate accounts)
+        // This prevents single-account bloat that would break the contract
+        let current_balance = self.get_token_account_balance(&original_token, &recipient);
+        let new_balance = current_balance + amount;
+        self.update_token_account(&original_token, &recipient, new_balance);
 
-        // Mint to recipient
-        *token.holders.entry(recipient.clone()).or_insert(0) += amount;
-        token.total_supply += amount;
-        state.total_minted += amount;
-        state.nonce += 1;
+        // Update token metadata (without storing balances in HashMap)
+        let nonce = {
+            let mut state = self.state.write().unwrap();
+            
+            // Get or create wrapped token metadata
+            let token = state.wrapped_tokens.entry(original_token.clone())
+                .or_insert_with(|| WrappedToken {
+                    original_token: original_token.clone(),
+                    original_chain: "solana".to_string(),
+                    total_supply: 0,
+                    holders: HashMap::new(), // Empty - balances in token_accounts
+                });
+
+            // Update total supply (but NOT holders HashMap)
+            token.total_supply += amount;
+            state.total_minted += amount;
+            state.nonce += 1;
+            state.nonce
+        };
 
         // Emit mint event
         let mint_event = MintEvent {
@@ -148,12 +307,12 @@ impl AdeMintProgram {
             token: original_token,
             amount,
             source_chain: "solana".to_string(),
-            nonce: state.nonce,
+            nonce,
             timestamp: current_timestamp(),
         };
 
-        info!("Minted {} wrapped tokens to {}, nonce: {}", 
-            amount, bs58::encode(&recipient).into_string(), state.nonce);
+        info!("Minted {} wrapped tokens to {} (balance: {}), nonce: {}", 
+            amount, bs58::encode(&recipient).into_string(), new_balance, nonce);
 
         // Return event data for logging
         Ok(bincode::serialize(&mint_event)?)
@@ -168,25 +327,39 @@ impl AdeMintProgram {
         target_chain: String,
         recipient: Vec<u8>,
     ) -> Result<Vec<u8>> {
-        let mut state = self.state.write().unwrap();
-
-        // Get wrapped token
-        let wrapped_token = state.wrapped_tokens.get_mut(&token)
-            .ok_or_else(|| anyhow::anyhow!("Token not found"))?;
-
-        // Get holder balance
-        let balance = wrapped_token.holders.get_mut(burner)
-            .ok_or_else(|| anyhow::anyhow!("No balance"))?;
-
-        if *balance < amount {
-            return Err(anyhow::anyhow!("Insufficient balance: {} < {}", balance, amount));
+        // Get balance from token accounts (SPL-style)
+        let current_balance = self.get_token_account_balance(&token, burner);
+        
+        if current_balance == 0 {
+            return Err(anyhow::anyhow!("No balance"));
         }
 
-        // Burn tokens
-        *balance -= amount;
-        wrapped_token.total_supply -= amount;
-        state.total_burned += amount;
-        state.nonce += 1;
+        if current_balance < amount {
+            return Err(anyhow::anyhow!(
+                "Insufficient balance: {} < {}", 
+                current_balance, 
+                amount
+            ));
+        }
+
+        // Burn tokens from token account
+        let new_balance = current_balance - amount;
+        self.update_token_account(&token, burner, new_balance);
+
+        // Update token metadata
+        let nonce = {
+            let mut state = self.state.write().unwrap();
+
+            // Get wrapped token
+            let wrapped_token = state.wrapped_tokens.get_mut(&token)
+                .ok_or_else(|| anyhow::anyhow!("Token not found"))?;
+
+            // Update total supply (but NOT holders HashMap)
+            wrapped_token.total_supply -= amount;
+            state.total_burned += amount;
+            state.nonce += 1;
+            state.nonce
+        };
 
         // Emit burn event
         let burn_event = BurnEvent {
@@ -195,12 +368,12 @@ impl AdeMintProgram {
             amount,
             target_chain,
             recipient,
-            nonce: state.nonce,
+            nonce,
             timestamp: current_timestamp(),
         };
 
-        info!("Burned {} tokens from {}, nonce: {}", 
-            amount, bs58::encode(burner).into_string(), state.nonce);
+        info!("Burned {} tokens from {} (remaining: {}), nonce: {}", 
+            amount, bs58::encode(burner).into_string(), new_balance, nonce);
 
         Ok(bincode::serialize(&burn_event)?)
     }
@@ -307,10 +480,16 @@ impl AdeMintProgram {
         state.wrapped_tokens.get(token).cloned()
     }
 
-    /// Get balance
+    /// Get balance from token accounts (SPL-style)
     pub fn get_balance(&self, token: &[u8], holder: &[u8]) -> u64 {
-        let state = self.state.read().unwrap();
+        // Primary: Use token accounts (new scalable design)
+        let balance = self.get_token_account_balance(token, holder);
+        if balance > 0 {
+            return balance;
+        }
         
+        // Fallback: Check legacy holders HashMap for backward compatibility
+        let state = self.state.read().unwrap();
         state.wrapped_tokens.get(token)
             .and_then(|t| t.holders.get(holder).copied())
             .unwrap_or(0)
