@@ -2,7 +2,7 @@ use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use anyhow::{Result, Context};
-use tracing::{info, warn, error};
+use tracing::{info, warn, error, debug};
 use ed25519_dalek::{Keypair, Signature, Signer, Verifier};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -648,15 +648,24 @@ impl Bridge {
     }
     
     /// Verify fraud evidence for invalid signature
+    /// 
+    /// This performs cryptographic verification using Ed25519 to prove
+    /// that a signature in the original proof is mathematically invalid.
     fn verify_invalid_signature_fraud(&self, evidence: &FraudEvidence) -> Result<FraudVerificationResult> {
+        use ed25519_dalek::{PublicKey, Signature as Ed25519Signature, Verifier};
+        
         // Verify that the signature in the original proof is indeed invalid
         let original_proof: BridgeProof = bincode::deserialize(&evidence.original_proof_data)
             .context("Failed to deserialize original proof")?;
+        
+        // Compute the message that should have been signed
+        let proof_hash = self.hash_proof(&original_proof);
         
         // Check each relayer signature
         for sig in &original_proof.relayer_signatures {
             // Verify signature is from an authorized relayer
             if !self.config.relayer_set.relayers.contains(&sig.relayer_pubkey) {
+                info!("Fraud detected: Signature from unauthorized relayer");
                 return Ok(FraudVerificationResult {
                     is_valid: true,
                     responsible_party: Some(sig.relayer_pubkey.clone()),
@@ -665,11 +674,9 @@ impl Bridge {
                 });
             }
             
-            // Verify the signature itself (using Ed25519)
-            let proof_hash = self.hash_proof(&original_proof);
-            
-            // Parse and verify signature
-            if sig.signature.len() != 64 || sig.relayer_pubkey.len() != 32 {
+            // Validate signature and public key lengths
+            if sig.signature.len() != 64 {
+                info!("Fraud detected: Invalid signature length: {}", sig.signature.len());
                 return Ok(FraudVerificationResult {
                     is_valid: true,
                     responsible_party: Some(sig.relayer_pubkey.clone()),
@@ -678,15 +685,69 @@ impl Bridge {
                 });
             }
             
-            // In production: actually verify the Ed25519 signature
-            // For now, we trust the evidence that provides proof of invalidity
+            if sig.relayer_pubkey.len() != 32 {
+                info!("Fraud detected: Invalid public key length: {}", sig.relayer_pubkey.len());
+                return Ok(FraudVerificationResult {
+                    is_valid: true,
+                    responsible_party: Some(sig.relayer_pubkey.clone()),
+                    slash_amount: self.calculate_slash_amount(&sig.relayer_pubkey),
+                    rejection_reason: String::new(),
+                });
+            }
+            
+            // Parse the public key
+            let pubkey_bytes: [u8; 32] = sig.relayer_pubkey.clone()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("Invalid public key bytes"))?;
+            
+            let public_key = match PublicKey::from_bytes(&pubkey_bytes) {
+                Ok(pk) => pk,
+                Err(e) => {
+                    info!("Fraud detected: Malformed public key: {}", e);
+                    return Ok(FraudVerificationResult {
+                        is_valid: true,
+                        responsible_party: Some(sig.relayer_pubkey.clone()),
+                        slash_amount: self.calculate_slash_amount(&sig.relayer_pubkey),
+                        rejection_reason: String::new(),
+                    });
+                }
+            };
+            
+            // Parse the signature
+            let sig_bytes: [u8; 64] = sig.signature.clone()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("Invalid signature bytes"))?;
+            
+            let signature = Ed25519Signature::from_bytes(&sig_bytes);
+            
+            // Cryptographically verify the signature
+            // If verification FAILS, the fraud proof is VALID (the signature is indeed invalid)
+            match public_key.verify(&proof_hash, &signature) {
+                Ok(()) => {
+                    // Signature is valid, continue checking others
+                    debug!("Signature from relayer {} verified successfully", 
+                        bs58::encode(&sig.relayer_pubkey).into_string());
+                }
+                Err(e) => {
+                    // Signature verification failed - fraud proof is valid!
+                    info!("Fraud confirmed: Invalid signature from relayer {}: {}", 
+                        bs58::encode(&sig.relayer_pubkey).into_string(), e);
+                    return Ok(FraudVerificationResult {
+                        is_valid: true,
+                        responsible_party: Some(sig.relayer_pubkey.clone()),
+                        slash_amount: self.calculate_slash_amount(&sig.relayer_pubkey),
+                        rejection_reason: String::new(),
+                    });
+                }
+            }
         }
         
+        // All signatures verified successfully - no fraud detected
         Ok(FraudVerificationResult {
             is_valid: false,
             responsible_party: None,
             slash_amount: 0,
-            rejection_reason: "All signatures appear valid".to_string(),
+            rejection_reason: "All signatures are cryptographically valid".to_string(),
         })
     }
     
