@@ -2,16 +2,18 @@ use std::collections::{HashMap, BTreeMap};
 use std::sync::{Arc, RwLock};
 use anyhow::{Result, Context};
 use serde::{Serialize, Deserialize};
-use tracing::{info, debug};
+use tracing::{info, debug, warn};
 
 use ade_transaction::Transaction;
 use crate::utils::{current_timestamp, to_base58};
 use crate::errors::{MempoolError, MempoolResult};
+use crate::storage::Storage;
 
-/// Transaction mempool with priority ordering
+/// Transaction mempool with priority ordering and DDoS protection
 ///
 /// The mempool stores pending transactions and orders them by fee priority.
-/// It enforces limits on capacity and per-account transactions.
+/// It enforces limits on capacity, per-account transactions, and validates
+/// sender balance and nonce to prevent DDoS attacks with invalid transactions.
 pub struct Mempool {
     /// Transactions indexed by signature
     transactions: Arc<RwLock<HashMap<Vec<u8>, MempoolTransaction>>>,
@@ -19,10 +21,16 @@ pub struct Mempool {
     priority_queue: Arc<RwLock<BTreeMap<u64, Vec<Vec<u8>>>>>,
     /// Transactions by sender for nonce tracking
     by_sender: Arc<RwLock<HashMap<Vec<u8>, Vec<Vec<u8>>>>>,
+    /// Expected nonce per sender (for sequential tx ordering)
+    sender_nonces: Arc<RwLock<HashMap<Vec<u8>, u64>>>,
     /// Configuration
     config: MempoolConfig,
     /// Statistics
     stats: Arc<RwLock<MempoolStats>>,
+    /// Optional storage reference for balance verification
+    storage: Option<Arc<Storage>>,
+    /// Cached account balances for fast verification
+    balance_cache: Arc<RwLock<HashMap<Vec<u8>, u64>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -35,6 +43,12 @@ pub struct MempoolConfig {
     pub min_fee: u64,
     /// Transaction expiration time in seconds
     pub expiration_time_secs: u64,
+    /// Whether to verify sender balance before accepting transactions
+    pub verify_balance: bool,
+    /// Whether to verify nonce ordering
+    pub verify_nonce: bool,
+    /// Minimum balance required beyond the transaction amount + fee
+    pub min_balance_buffer: u64,
 }
 
 impl Default for MempoolConfig {
@@ -44,6 +58,9 @@ impl Default for MempoolConfig {
             max_per_account: 64,
             min_fee: 5000,
             expiration_time_secs: 120,
+            verify_balance: true,
+            verify_nonce: true,
+            min_balance_buffer: 10_000, // Minimum extra lamports beyond tx cost
         }
     }
 }
@@ -90,12 +107,36 @@ impl Mempool {
             transactions: Arc::new(RwLock::new(HashMap::new())),
             priority_queue: Arc::new(RwLock::new(BTreeMap::new())),
             by_sender: Arc::new(RwLock::new(HashMap::new())),
+            sender_nonces: Arc::new(RwLock::new(HashMap::new())),
             config,
             stats: Arc::new(RwLock::new(MempoolStats::default())),
+            storage: None,
+            balance_cache: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+    
+    /// Create a mempool with storage for balance verification
+    pub fn with_storage(config: MempoolConfig, storage: Arc<Storage>) -> Self {
+        Self {
+            transactions: Arc::new(RwLock::new(HashMap::new())),
+            priority_queue: Arc::new(RwLock::new(BTreeMap::new())),
+            by_sender: Arc::new(RwLock::new(HashMap::new())),
+            sender_nonces: Arc::new(RwLock::new(HashMap::new())),
+            config,
+            stats: Arc::new(RwLock::new(MempoolStats::default())),
+            storage: Some(storage),
+            balance_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
-    /// Add transaction to mempool
+    /// Add transaction to mempool with full validation
+    ///
+    /// This validates:
+    /// 1. Signature validity
+    /// 2. Fee requirements
+    /// 3. Sender balance (if storage is available)
+    /// 4. Nonce ordering (if enabled)
+    /// 5. Per-account limits
     ///
     /// # Arguments
     /// * `tx` - Transaction to add
@@ -109,6 +150,7 @@ impl Mempool {
             .ok_or(MempoolError::DuplicateTransaction)?
             .clone();
 
+        // Check for duplicate transaction
         {
             let txs = self.transactions.read().unwrap();
             if txs.contains_key(&signature) {
@@ -116,12 +158,15 @@ impl Mempool {
             }
         }
 
+        // Verify signature
         tx.verify()
-            .map_err(|e| MempoolError::TransactionTooLarge { size: 0, max: 0 })?;
+            .map_err(|_| MempoolError::TransactionTooLarge { size: 0, max: 0 })?;
 
+        // Check minimum fee
         if fee < self.config.min_fee {
             let mut stats = self.stats.write().unwrap();
             stats.total_rejected += 1;
+            warn!("Transaction rejected: fee {} below minimum {}", fee, self.config.min_fee);
             return Err(MempoolError::FeeTooLow { fee, min_fee: self.config.min_fee });
         }
 
@@ -129,17 +174,49 @@ impl Mempool {
             .ok_or(MempoolError::DuplicateTransaction)?
             .clone();
 
+        // Calculate total cost (amount + fee + priority_fee)
+        let total_cost = tx.total_amount() + fee + priority_fee;
+
+        // Verify sender balance (DDoS protection)
+        if self.config.verify_balance {
+            if let Err(e) = self.verify_sender_balance(&sender, total_cost) {
+                let mut stats = self.stats.write().unwrap();
+                stats.total_rejected += 1;
+                warn!(
+                    "Transaction rejected: sender {} insufficient balance for {} lamports",
+                    to_base58(&sender), total_cost
+                );
+                return Err(e);
+            }
+        }
+
+        // Verify nonce (prevent nonce gaps)
+        if self.config.verify_nonce {
+            if let Err(e) = self.verify_nonce(&sender, &tx) {
+                let mut stats = self.stats.write().unwrap();
+                stats.total_rejected += 1;
+                warn!("Transaction rejected: nonce verification failed for {}", to_base58(&sender));
+                return Err(e);
+            }
+        }
+
+        // Check per-account limit
         {
             let by_sender = self.by_sender.read().unwrap();
             if let Some(sender_txs) = by_sender.get(&sender) {
                 if sender_txs.len() >= self.config.max_per_account {
                     let mut stats = self.stats.write().unwrap();
                     stats.total_rejected += 1;
+                    warn!(
+                        "Transaction rejected: account {} exceeds limit of {} pending transactions",
+                        to_base58(&sender), self.config.max_per_account
+                    );
                     return Err(MempoolError::AccountLimitExceeded);
                 }
             }
         }
 
+        // Evict if at capacity
         {
             let txs = self.transactions.read().unwrap();
             if txs.len() >= self.config.max_transactions {
@@ -147,6 +224,7 @@ impl Mempool {
             }
         }
 
+        // Create mempool transaction
         let mempool_tx = MempoolTransaction {
             transaction: tx.clone(),
             signature: signature.clone(),
@@ -158,11 +236,13 @@ impl Mempool {
             compute_budget: 1_000_000,
         };
 
+        // Add to transactions map
         {
             let mut txs = self.transactions.write().unwrap();
             txs.insert(signature.clone(), mempool_tx);
         }
 
+        // Add to priority queue
         {
             let total_fee = fee + priority_fee;
             let mut queue = self.priority_queue.write().unwrap();
@@ -171,13 +251,18 @@ impl Mempool {
                 .push(signature.clone());
         }
 
+        // Add to sender index
         {
             let mut by_sender = self.by_sender.write().unwrap();
-            by_sender.entry(sender)
+            by_sender.entry(sender.clone())
                 .or_insert_with(Vec::new)
                 .push(signature.clone());
         }
 
+        // Update pending balance (deduct from cached balance)
+        self.update_pending_balance(&sender, total_cost);
+
+        // Update statistics
         {
             let mut stats = self.stats.write().unwrap();
             stats.total_transactions += 1;
@@ -191,8 +276,117 @@ impl Mempool {
             stats.average_fee = (stats.average_fee * (total_txs - 1) + total_fee) / total_txs;
         }
 
-        info!("Added transaction to mempool: {}", to_base58(&signature));
+        debug!("Added transaction to mempool: {}", to_base58(&signature));
         Ok(signature)
+    }
+    
+    /// Verify sender has sufficient balance for the transaction
+    fn verify_sender_balance(&self, sender: &[u8], required_amount: u64) -> MempoolResult<()> {
+        // First check the cached balance (includes pending tx deductions)
+        {
+            let cache = self.balance_cache.read().unwrap();
+            if let Some(&cached_balance) = cache.get(sender) {
+                if cached_balance >= required_amount + self.config.min_balance_buffer {
+                    return Ok(());
+                }
+                // Cached balance is insufficient
+                return Err(MempoolError::InsufficientBalance);
+            }
+        }
+        
+        // Cache miss - fetch from storage
+        if let Some(ref storage) = self.storage {
+            match storage.get_account(sender) {
+                Ok(Some(account_data)) => {
+                    // Parse account to get balance
+                    // Format: first 8 bytes are lamports
+                    if account_data.len() >= 8 {
+                        let lamports = u64::from_le_bytes(
+                            account_data[0..8].try_into().unwrap_or([0u8; 8])
+                        );
+                        
+                        // Cache the balance
+                        {
+                            let mut cache = self.balance_cache.write().unwrap();
+                            cache.insert(sender.to_vec(), lamports);
+                        }
+                        
+                        if lamports >= required_amount + self.config.min_balance_buffer {
+                            return Ok(());
+                        }
+                    }
+                    Err(MempoolError::InsufficientBalance)
+                }
+                Ok(None) => {
+                    // Account doesn't exist - definitely can't pay
+                    Err(MempoolError::InsufficientBalance)
+                }
+                Err(_) => {
+                    // Storage error - allow transaction (fail safe)
+                    warn!("Failed to verify balance from storage, allowing transaction");
+                    Ok(())
+                }
+            }
+        } else {
+            // No storage configured - skip balance check
+            Ok(())
+        }
+    }
+    
+    /// Verify transaction nonce is correct
+    fn verify_nonce(&self, sender: &[u8], tx: &Transaction) -> MempoolResult<()> {
+        let tx_nonce = tx.get_nonce().unwrap_or(0);
+        
+        let expected_nonce = {
+            let nonces = self.sender_nonces.read().unwrap();
+            nonces.get(sender).copied().unwrap_or(0)
+        };
+        
+        // Allow nonce to be equal or greater (for out-of-order arrival)
+        // But reject if too far in the future (> 64 nonces ahead)
+        if tx_nonce < expected_nonce {
+            warn!(
+                "Nonce too low: got {}, expected >= {}",
+                tx_nonce, expected_nonce
+            );
+            return Err(MempoolError::InvalidNonce);
+        }
+        
+        if tx_nonce > expected_nonce + 64 {
+            warn!(
+                "Nonce too high: got {}, expected <= {}",
+                tx_nonce, expected_nonce + 64
+            );
+            return Err(MempoolError::InvalidNonce);
+        }
+        
+        Ok(())
+    }
+    
+    /// Update the pending balance after adding a transaction
+    fn update_pending_balance(&self, sender: &[u8], deduction: u64) {
+        let mut cache = self.balance_cache.write().unwrap();
+        if let Some(balance) = cache.get_mut(sender) {
+            *balance = balance.saturating_sub(deduction);
+        }
+    }
+    
+    /// Update sender nonce after transaction confirmation
+    pub fn update_sender_nonce(&self, sender: &[u8], new_nonce: u64) {
+        let mut nonces = self.sender_nonces.write().unwrap();
+        nonces.insert(sender.to_vec(), new_nonce);
+    }
+    
+    /// Refresh balance cache for a sender
+    pub fn refresh_balance_cache(&self, sender: &[u8], new_balance: u64) {
+        let mut cache = self.balance_cache.write().unwrap();
+        cache.insert(sender.to_vec(), new_balance);
+    }
+    
+    /// Clear the balance cache
+    pub fn clear_balance_cache(&self) {
+        let mut cache = self.balance_cache.write().unwrap();
+        cache.clear();
     }
 
     /// Get transaction from mempool by signature

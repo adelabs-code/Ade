@@ -113,6 +113,12 @@ pub enum MempoolError {
 
     #[error("Transaction too large: {size} > {max}")]
     TransactionTooLarge { size: usize, max: usize },
+    
+    #[error("Insufficient balance for transaction")]
+    InsufficientBalance,
+    
+    #[error("Invalid transaction nonce")]
+    InvalidNonce,
 }
 
 /// Convert Result<T, NodeError> to Result<T, anyhow::Error>
