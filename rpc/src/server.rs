@@ -6,24 +6,14 @@ use axum::{
 };
 use tower_http::cors::{CorsLayer, Any};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use anyhow::Result;
 use tracing::info;
 
 use crate::handlers::*;
 use crate::types::{RpcRequest, RpcResponse};
+use crate::state::RpcStateBackend;
 
-#[derive(Clone)]
-pub struct RpcState {
-    pub chain_state: Arc<RwLock<ChainState>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ChainState {
-    pub current_slot: u64,
-    pub latest_blockhash: Vec<u8>,
-    pub transaction_count: u64,
-}
+pub type RpcState = Arc<RpcStateBackend>;
 
 pub struct RpcServer {
     port: u16,
@@ -32,14 +22,12 @@ pub struct RpcServer {
 
 impl RpcServer {
     pub fn new(port: u16) -> Self {
-        let state = RpcState {
-            chain_state: Arc::new(RwLock::new(ChainState {
-                current_slot: 0,
-                latest_blockhash: vec![0u8; 32],
-                transaction_count: 0,
-            })),
-        };
+        let state = Arc::new(RpcStateBackend::new());
 
+        Self { port, state }
+    }
+
+    pub fn with_state(port: u16, state: RpcState) -> Self {
         Self { port, state }
     }
 
@@ -148,11 +136,18 @@ async fn health_check() -> &'static str {
 
 async fn metrics(State(state): State<RpcState>) -> Json<serde_json::Value> {
     let chain = state.chain_state.read().await;
+    let accounts = state.accounts.read().await;
+    let transactions = state.transactions.read().await;
+    let blocks = state.blocks.read().await;
+    
     Json(serde_json::json!({
         "slot": chain.current_slot,
-        "transaction_count": chain.transaction_count,
+        "transaction_count": transactions.len(),
+        "account_count": accounts.len(),
+        "block_count": blocks.len(),
         "tps": 8500,
         "validator_count": 5,
-        "uptime_seconds": 86400
+        "uptime_seconds": 86400,
+        "finalized_slot": chain.finalized_slot,
     }))
 }
