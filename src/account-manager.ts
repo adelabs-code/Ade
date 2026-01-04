@@ -270,9 +270,12 @@ export class ProgramAccountManager {
 }
 
 /**
- * Token account manager
+ * Token account manager with proper RPC integration
  */
 export class TokenAccountManager {
+  private balanceCache: Map<string, { balance: bigint; timestamp: number }> = new Map();
+  private cacheExpiry: number = 5000; // 5 seconds
+
   constructor(private client: AdeSidechainClient) {}
 
   /**
@@ -282,37 +285,230 @@ export class TokenAccountManager {
     owner: string,
     mint?: string
   ): Promise<TokenAccount[]> {
-    const options = mint ? { mint } : {};
-    const result = await this.client.getTokenAccountsByOwner(owner, options);
+    try {
+      const options = mint ? { mint } : {};
+      const result = await this.client.getTokenAccountsByOwner(owner, options);
 
-    if (!result.value) {
+      if (!result || !result.value) {
+        return [];
+      }
+
+      const accounts: TokenAccount[] = [];
+      for (const item of result.value) {
+        const parsed = await this.parseTokenAccount(item);
+        if (parsed) {
+          accounts.push(parsed);
+        }
+      }
+
+      return accounts;
+    } catch (error) {
+      console.error('Error fetching token accounts:', error);
       return [];
     }
-
-    return result.value.map((item: any) => this.parseTokenAccount(item));
   }
 
   /**
-   * Parse token account data
+   * Parse token account data from RPC response
    */
-  private parseTokenAccount(item: any): TokenAccount {
-    // Simplified parsing - in production would decode actual token account data
-    return {
-      address: item.pubkey,
-      mint: 'TokenMintAddress',
-      owner: item.account.owner,
-      amount: BigInt(0),
-      decimals: 9,
-    };
+  private async parseTokenAccount(item: any): Promise<TokenAccount | null> {
+    try {
+      const pubkey = item.pubkey;
+      const accountData = item.account;
+
+      // Parse the token account data based on the SPL Token Account layout
+      // Account data is base64 encoded
+      let mint = '';
+      let owner = '';
+      let amount = BigInt(0);
+      let decimals = 9;
+
+      if (accountData.data) {
+        const data = typeof accountData.data === 'string' 
+          ? Buffer.from(accountData.data, 'base64')
+          : accountData.data;
+
+        // SPL Token Account layout:
+        // - mint (32 bytes)
+        // - owner (32 bytes)
+        // - amount (8 bytes, little-endian u64)
+        // - delegate option (36 bytes)
+        // - state (1 byte)
+        // - is_native option (12 bytes)
+        // - delegated_amount (8 bytes)
+        // - close_authority option (36 bytes)
+
+        if (data.length >= 72) {
+          // Extract mint (first 32 bytes)
+          mint = this.encodeBase58(data.slice(0, 32));
+          
+          // Extract owner (bytes 32-64)
+          owner = this.encodeBase58(data.slice(32, 64));
+          
+          // Extract amount (bytes 64-72, little-endian u64)
+          amount = this.readUint64LE(data, 64);
+        }
+
+        // Try to get decimals from mint info
+        try {
+          const mintInfo = await this.client.call<{ decimals: number }>(
+            'getTokenSupply',
+            { mint }
+          );
+          decimals = mintInfo?.decimals ?? 9;
+        } catch {
+          decimals = 9; // Default to 9 decimals
+        }
+      }
+
+      return {
+        address: pubkey,
+        mint,
+        owner: owner || accountData.owner,
+        amount,
+        decimals,
+      };
+    } catch (error) {
+      console.error('Error parsing token account:', error);
+      return null;
+    }
   }
 
   /**
-   * Get token balance
+   * Get token balance from RPC
    */
   async getTokenBalance(tokenAccount: string): Promise<bigint> {
-    const account = await this.client.getAccountInfo(tokenAccount);
-    // Would parse token account data
-    return BigInt(0);
+    // Check cache first
+    const cached = this.balanceCache.get(tokenAccount);
+    if (cached && Date.now() - cached.timestamp < this.cacheExpiry) {
+      return cached.balance;
+    }
+
+    try {
+      // Try the getTokenAccountBalance RPC method first
+      const result = await this.client.call<{
+        value: {
+          amount: string;
+          decimals: number;
+          uiAmount: number;
+        };
+      }>('getTokenAccountBalance', { pubkey: tokenAccount });
+
+      if (result?.value?.amount) {
+        const balance = BigInt(result.value.amount);
+        this.balanceCache.set(tokenAccount, { balance, timestamp: Date.now() });
+        return balance;
+      }
+
+      // Fallback: parse account data directly
+      const accountInfo = await this.client.getAccountInfo(tokenAccount);
+      if (accountInfo && accountInfo.data) {
+        const data = typeof accountInfo.data === 'string'
+          ? Buffer.from(accountInfo.data, 'base64')
+          : accountInfo.data;
+
+        if (data.length >= 72) {
+          const balance = this.readUint64LE(data, 64);
+          this.balanceCache.set(tokenAccount, { balance, timestamp: Date.now() });
+          return balance;
+        }
+      }
+
+      return BigInt(0);
+    } catch (error) {
+      console.error('Error fetching token balance:', error);
+      
+      // Return cached value if available, even if expired
+      if (cached) {
+        return cached.balance;
+      }
+      
+      return BigInt(0);
+    }
+  }
+
+  /**
+   * Get all token balances for an owner
+   */
+  async getAllTokenBalances(owner: string): Promise<Map<string, bigint>> {
+    const balances = new Map<string, bigint>();
+    
+    try {
+      const accounts = await this.getTokenAccountsByOwner(owner);
+      
+      for (const account of accounts) {
+        balances.set(account.mint, account.amount);
+      }
+    } catch (error) {
+      console.error('Error fetching all token balances:', error);
+    }
+
+    return balances;
+  }
+
+  /**
+   * Read a little-endian uint64 from a buffer
+   */
+  private readUint64LE(buffer: Buffer, offset: number): bigint {
+    const low = buffer.readUInt32LE(offset);
+    const high = buffer.readUInt32LE(offset + 4);
+    return BigInt(low) + (BigInt(high) << 32n);
+  }
+
+  /**
+   * Encode bytes to base58
+   */
+  private encodeBase58(bytes: Buffer): string {
+    const ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+    
+    if (bytes.length === 0) return '';
+    
+    // Count leading zeros
+    let zeros = 0;
+    for (let i = 0; i < bytes.length && bytes[i] === 0; i++) {
+      zeros++;
+    }
+    
+    // Convert to base58
+    const size = Math.ceil(bytes.length * 138 / 100) + 1;
+    const b58 = new Uint8Array(size);
+    
+    for (const byte of bytes) {
+      let carry = byte;
+      for (let j = size - 1; j >= 0; j--) {
+        carry += 256 * b58[j];
+        b58[j] = carry % 58;
+        carry = Math.floor(carry / 58);
+      }
+    }
+    
+    // Skip leading zeros in base58 result
+    let i = 0;
+    while (i < size && b58[i] === 0) {
+      i++;
+    }
+    
+    // Build string
+    let str = '1'.repeat(zeros);
+    for (; i < size; i++) {
+      str += ALPHABET[b58[i]];
+    }
+    
+    return str;
+  }
+
+  /**
+   * Invalidate cache for a specific account
+   */
+  invalidateCache(tokenAccount: string): void {
+    this.balanceCache.delete(tokenAccount);
+  }
+
+  /**
+   * Clear entire balance cache
+   */
+  clearCache(): void {
+    this.balanceCache.clear();
   }
 }
 

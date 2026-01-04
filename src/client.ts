@@ -149,7 +149,13 @@ export class AdeSidechainClient {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
-  private async call<T>(method: string, params?: any): Promise<T> {
+  /**
+   * Make an RPC call to the node
+   * @param method - The RPC method name
+   * @param params - Optional parameters for the method
+   * @returns The result of the RPC call
+   */
+  async call<T>(method: string, params?: any): Promise<T> {
     const request: RpcRequest = {
       jsonrpc: '2.0',
       id: this.requestId++,
@@ -252,6 +258,18 @@ export class AdeSidechainClient {
 
   async getMultipleAccounts(addresses: string[]): Promise<any> {
     return this.call('getMultipleAccounts', { addresses });
+  }
+
+  async getTokenAccountsByOwner(owner: string, options?: { mint?: string }): Promise<any> {
+    return this.call('getTokenAccountsByOwner', { owner, ...options });
+  }
+
+  async getProgramAccounts(programId: string, filters?: any[]): Promise<any> {
+    return this.call('getProgramAccounts', { programId, filters });
+  }
+
+  async getRecentPrioritizationFees(options?: { count?: number }): Promise<any> {
+    return this.call('getRecentPrioritizationFees', options);
   }
 
   async getHealth(): Promise<{ status: string }> {
