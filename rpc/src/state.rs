@@ -55,6 +55,18 @@ pub struct AIAgentData {
     pub status: String,
     pub config: serde_json::Value,
     pub created_at: u64,
+    /// Actual execution history records (limited to recent entries)
+    pub execution_history: Vec<ExecutionRecord>,
+}
+
+/// Record of a single AI agent execution
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionRecord {
+    pub execution_id: Vec<u8>,
+    pub timestamp: u64,
+    pub compute_used: u64,
+    pub success: bool,
+    pub input_hash: Vec<u8>,
 }
 
 impl RpcStateBackend {
@@ -223,6 +235,7 @@ mod tests {
             status: "active".to_string(),
             config: serde_json::json!({}),
             created_at: 12345,
+            execution_history: Vec::new(),
         };
         
         state.add_ai_agent(agent.clone()).await;
@@ -231,5 +244,8 @@ mod tests {
         assert!(retrieved.is_some());
     }
 }
+
+
+
 
 

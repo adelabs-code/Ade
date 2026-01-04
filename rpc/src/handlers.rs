@@ -894,6 +894,7 @@ pub async fn deploy_ai_agent(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs(),
+        execution_history: Vec::new(), // Initially empty, populated by executions
     };
 
     // Store agent
@@ -1110,8 +1111,7 @@ pub async fn get_ai_agent_executions(
     let agents = state.ai_agents.read().await;
     
     if let Some(agent) = agents.get(&agent_id_bytes) {
-        // In production, executions would be stored separately
-        // For now, return summary based on agent stats
+        // Return actual execution records stored in the agent
         let execution_count = agent.execution_count;
         let total_compute = agent.total_compute_used;
         let avg_compute = if execution_count > 0 {
@@ -1120,21 +1120,33 @@ pub async fn get_ai_agent_executions(
             0
         };
 
-        // Generate mock execution history based on actual execution count
-        let executions: Vec<_> = (0..execution_count.min(10)).map(|i| {
-            json!({
-                "executionId": format!("exec_{}_{}", bs58::encode(&agent_id_bytes).into_string(), i),
-                "timestamp": agent.created_at + (i * 60),
-                "computeUnits": avg_compute,
-                "status": "success"
+        // Use actual execution history from the agent data
+        // Each agent stores its own execution records
+        let executions: Vec<serde_json::Value> = agent.execution_history
+            .iter()
+            .rev() // Most recent first
+            .take(10) // Limit to 10 most recent
+            .map(|record| {
+                json!({
+                    "executionId": bs58::encode(&record.execution_id).into_string(),
+                    "timestamp": record.timestamp,
+                    "computeUnits": record.compute_used,
+                    "status": if record.success { "success" } else { "failed" },
+                    "inputHash": bs58::encode(&record.input_hash).into_string()
+                })
             })
-        }).collect();
+            .collect();
 
         Json(RpcResponse::success(json!({
             "executions": executions,
             "total": execution_count,
             "totalComputeUsed": total_compute,
-            "averageComputePerExecution": avg_compute
+            "averageComputePerExecution": avg_compute,
+            "note": if executions.is_empty() && execution_count > 0 {
+                "Historical records may have been pruned"
+            } else {
+                ""
+            }
         })))
     } else {
         Json(RpcResponse::error(&format!("Agent not found: {}", agent_id_str)))
