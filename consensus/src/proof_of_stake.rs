@@ -37,6 +37,9 @@ pub struct ProofOfStake {
     min_stake_requirement: u64,
     epoch_length: u64,
     current_epoch: u64,
+    /// Hash of the last finalized block in the previous epoch
+    /// Used for grinding-resistant randomness generation
+    previous_epoch_hash: Vec<u8>,
 }
 
 impl ProofOfStake {
@@ -47,7 +50,15 @@ impl ProofOfStake {
             min_stake_requirement,
             epoch_length,
             current_epoch: 0,
+            previous_epoch_hash: vec![0u8; 32], // Genesis epoch has no previous hash
         }
+    }
+    
+    /// Update the previous epoch hash when transitioning to a new epoch
+    /// This should be called with the finalized block hash of the last slot
+    /// in the previous epoch
+    pub fn set_previous_epoch_hash(&mut self, hash: Vec<u8>) {
+        self.previous_epoch_hash = hash;
     }
 
     /// Register a new validator
@@ -165,26 +176,52 @@ impl ProofOfStake {
         final_hasher.finalize().to_vec()
     }
     
-    /// Compute epoch randomness from validator participation
-    /// This creates a pseudo-VRF by combining validator inputs deterministically
+    /// Compute epoch randomness from immutable validator data
+    /// 
+    /// SECURITY: This function MUST NOT include any validator-controlled variables
+    /// that can be manipulated to influence the randomness output.
+    /// 
+    /// REMOVED: `last_vote_slot` - validators could manipulate their voting timing
+    /// to influence the random seed and gain advantage in leader selection.
+    /// 
+    /// Instead, we use:
+    /// - Epoch number (deterministic, protocol-defined)
+    /// - Validator public keys (fixed at registration)
+    /// - Validator stake amounts (changes are slow and visible on-chain)
+    /// - Previous epoch's finalized block hash (immutable once finalized)
     fn compute_epoch_randomness(&self) -> Vec<u8> {
         let mut hasher = Sha256::new();
-        hasher.update(b"EPOCH_RANDOMNESS");
+        hasher.update(b"EPOCH_RANDOMNESS_V2"); // Version bump for new algorithm
         hasher.update(&self.current_epoch.to_le_bytes());
         
+        // Include the previous epoch's final block hash as a source of randomness
+        // This is immutable once the previous epoch is finalized
+        hasher.update(&self.previous_epoch_hash);
+        
         // Include sorted validator pubkeys and their stakes for determinism
+        // NOTE: We intentionally do NOT include last_vote_slot as it can be gamed
         let mut validators: Vec<_> = self.validators.values()
             .filter(|v| v.active)
             .collect();
         validators.sort_by(|a, b| a.pubkey.cmp(&b.pubkey));
         
+        // Use only immutable or slowly-changing data
         for validator in validators {
             hasher.update(&validator.pubkey);
             hasher.update(&validator.stake.to_le_bytes());
-            hasher.update(&validator.last_vote_slot.to_le_bytes());
+            // Include activation epoch (when validator joined) - immutable
+            hasher.update(&validator.activated_epoch.to_le_bytes());
         }
         
-        hasher.finalize().to_vec()
+        // Add additional entropy from multiple hash rounds (increases grinding cost)
+        let intermediate = hasher.finalize();
+        
+        let mut final_hasher = Sha256::new();
+        final_hasher.update(b"EPOCH_RANDOMNESS_FINAL");
+        final_hasher.update(&intermediate);
+        final_hasher.update(&self.current_epoch.to_le_bytes());
+        
+        final_hasher.finalize().to_vec()
     }
     
     /// Generate a VRF proof for leader election
