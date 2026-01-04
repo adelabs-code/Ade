@@ -3,12 +3,13 @@ pub mod relayer;
 pub mod lock_contract;
 pub mod merkle;
 pub mod multisig;
+pub mod proof_verification;
+pub mod event_parser;
 
 // Re-export Solana program types
 pub mod solana_lock {
     pub use super::lock_contract::*;
     
-    // Include BridgeProof for cross-module use
     use serde::{Serialize, Deserialize};
     
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,3 +27,5 @@ pub use relayer::{Relayer, RelayerConfig, RelayerStats};
 pub use lock_contract::{LockContract, DepositEvent, WithdrawalEvent};
 pub use merkle::{MerkleTree, MerkleProof, SparseMerkleTree};
 pub use multisig::{MultiSigRelayer, RelayerSignature, MultiSigError, RelayerSetManager};
+pub use proof_verification::{ProofVerifier, ProofBuilder, VerificationResult};
+pub use event_parser::{EventParser, EventEmitter, ParsedDepositEvent, ParsedWithdrawalEvent, EmittedEvent, EventType};
