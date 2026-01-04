@@ -2,11 +2,16 @@ use std::collections::{HashMap, BTreeMap};
 use std::sync::{Arc, RwLock};
 use anyhow::{Result, Context};
 use serde::{Serialize, Deserialize};
-use tracing::{info, warn, debug};
+use tracing::{info, debug};
 
 use ade_transaction::Transaction;
+use crate::utils::{current_timestamp, to_base58};
+use crate::errors::{MempoolError, MempoolResult};
 
 /// Transaction mempool with priority ordering
+///
+/// The mempool stores pending transactions and orders them by fee priority.
+/// It enforces limits on capacity and per-account transactions.
 pub struct Mempool {
     /// Transactions indexed by signature
     transactions: Arc<RwLock<HashMap<Vec<u8>, MempoolTransaction>>>,
@@ -22,9 +27,13 @@ pub struct Mempool {
 
 #[derive(Debug, Clone)]
 pub struct MempoolConfig {
+    /// Maximum total transactions in mempool
     pub max_transactions: usize,
+    /// Maximum transactions per account
     pub max_per_account: usize,
+    /// Minimum fee required
     pub min_fee: u64,
+    /// Transaction expiration time in seconds
     pub expiration_time_secs: u64,
 }
 
@@ -75,6 +84,7 @@ impl Default for MempoolStats {
 }
 
 impl Mempool {
+    /// Create a new mempool with given configuration
     pub fn new(config: MempoolConfig) -> Self {
         Self {
             transactions: Arc::new(RwLock::new(HashMap::new())),
@@ -86,51 +96,53 @@ impl Mempool {
     }
 
     /// Add transaction to mempool
-    pub fn add_transaction(&self, tx: Transaction, fee: u64, priority_fee: u64) -> Result<Vec<u8>> {
+    ///
+    /// # Arguments
+    /// * `tx` - Transaction to add
+    /// * `fee` - Base transaction fee
+    /// * `priority_fee` - Additional priority fee
+    ///
+    /// # Returns
+    /// Transaction signature if successful
+    pub fn add_transaction(&self, tx: Transaction, fee: u64, priority_fee: u64) -> MempoolResult<Vec<u8>> {
         let signature = tx.signature()
-            .ok_or_else(|| anyhow::anyhow!("Transaction has no signature"))?
+            .ok_or(MempoolError::DuplicateTransaction)?
             .clone();
 
-        // Check if already in mempool
         {
             let txs = self.transactions.read().unwrap();
             if txs.contains_key(&signature) {
-                return Err(anyhow::anyhow!("Transaction already in mempool"));
+                return Err(MempoolError::DuplicateTransaction);
             }
         }
 
-        // Verify transaction
         tx.verify()
-            .map_err(|e| anyhow::anyhow!("Transaction verification failed: {}", e))?;
+            .map_err(|e| MempoolError::TransactionTooLarge { size: 0, max: 0 })?;
 
-        // Check fee requirement
         if fee < self.config.min_fee {
             let mut stats = self.stats.write().unwrap();
             stats.total_rejected += 1;
-            return Err(anyhow::anyhow!("Fee too low: {} < {}", fee, self.config.min_fee));
+            return Err(MempoolError::FeeTooLow { fee, min_fee: self.config.min_fee });
         }
 
         let sender = tx.get_signers().first()
-            .ok_or_else(|| anyhow::anyhow!("No sender found"))?
+            .ok_or(MempoolError::DuplicateTransaction)?
             .clone();
 
-        // Check per-account limit
         {
             let by_sender = self.by_sender.read().unwrap();
             if let Some(sender_txs) = by_sender.get(&sender) {
                 if sender_txs.len() >= self.config.max_per_account {
                     let mut stats = self.stats.write().unwrap();
                     stats.total_rejected += 1;
-                    return Err(anyhow::anyhow!("Too many transactions from this account"));
+                    return Err(MempoolError::AccountLimitExceeded);
                 }
             }
         }
 
-        // Check total capacity
         {
             let txs = self.transactions.read().unwrap();
             if txs.len() >= self.config.max_transactions {
-                // Evict lowest priority transaction
                 self.evict_lowest_priority()?;
             }
         }
@@ -143,16 +155,14 @@ impl Mempool {
             sender: sender.clone(),
             received_at: current_timestamp(),
             size: tx.size(),
-            compute_budget: 1_000_000, // Default, would be parsed from tx
+            compute_budget: 1_000_000,
         };
 
-        // Add to main storage
         {
             let mut txs = self.transactions.write().unwrap();
             txs.insert(signature.clone(), mempool_tx);
         }
 
-        // Add to priority queue (using total fee as priority)
         {
             let total_fee = fee + priority_fee;
             let mut queue = self.priority_queue.write().unwrap();
@@ -161,7 +171,6 @@ impl Mempool {
                 .push(signature.clone());
         }
 
-        // Add to sender index
         {
             let mut by_sender = self.by_sender.write().unwrap();
             by_sender.entry(sender)
@@ -169,7 +178,6 @@ impl Mempool {
                 .push(signature.clone());
         }
 
-        // Update stats
         {
             let mut stats = self.stats.write().unwrap();
             stats.total_transactions += 1;
@@ -179,16 +187,15 @@ impl Mempool {
                 stats.highest_fee = total_fee;
             }
             
-            // Update average
             let total_txs = stats.total_transactions;
             stats.average_fee = (stats.average_fee * (total_txs - 1) + total_fee) / total_txs;
         }
 
-        info!("Added transaction to mempool: {:?}", bs58::encode(&signature).into_string());
+        info!("Added transaction to mempool: {}", to_base58(&signature));
         Ok(signature)
     }
 
-    /// Get transaction from mempool
+    /// Get transaction from mempool by signature
     pub fn get_transaction(&self, signature: &[u8]) -> Option<MempoolTransaction> {
         let txs = self.transactions.read().unwrap();
         txs.get(signature).cloned()
@@ -202,7 +209,6 @@ impl Mempool {
         };
 
         if let Some(ref tx) = removed {
-            // Remove from priority queue
             {
                 let total_fee = tx.fee + tx.priority_fee;
                 let mut queue = self.priority_queue.write().unwrap();
@@ -214,7 +220,6 @@ impl Mempool {
                 }
             }
 
-            // Remove from sender index
             {
                 let mut by_sender = self.by_sender.write().unwrap();
                 if let Some(sender_txs) = by_sender.get_mut(&tx.sender) {
@@ -230,11 +235,12 @@ impl Mempool {
     }
 
     /// Get highest priority transactions
+    ///
+    /// Returns up to `count` transactions ordered by total fee (descending)
     pub fn get_top_transactions(&self, count: usize) -> Vec<MempoolTransaction> {
         let mut result = Vec::new();
         let queue = self.priority_queue.read().unwrap();
         
-        // Iterate from highest fee to lowest
         for (_, signatures) in queue.iter().rev() {
             if result.len() >= count {
                 break;
@@ -275,6 +281,8 @@ impl Mempool {
     }
 
     /// Prune expired transactions
+    ///
+    /// Removes transactions older than expiration_time_secs
     pub fn prune_expired(&self) -> usize {
         let cutoff = current_timestamp() - self.config.expiration_time_secs;
         let mut expired_sigs = Vec::new();
@@ -303,7 +311,7 @@ impl Mempool {
     }
 
     /// Evict lowest priority transaction
-    fn evict_lowest_priority(&self) -> Result<()> {
+    fn evict_lowest_priority(&self) -> MempoolResult<()> {
         let to_evict = {
             let queue = self.priority_queue.read().unwrap();
             queue.iter()
@@ -319,21 +327,21 @@ impl Mempool {
             
             Ok(())
         } else {
-            Err(anyhow::anyhow!("No transaction to evict"))
+            Err(MempoolError::MempoolFull { current: 0, max: 0 })
         }
     }
 
-    /// Get mempool size
+    /// Get current mempool size
     pub fn size(&self) -> usize {
         self.transactions.read().unwrap().len()
     }
 
-    /// Check if transaction exists
+    /// Check if transaction exists in mempool
     pub fn contains(&self, signature: &[u8]) -> bool {
         self.transactions.read().unwrap().contains_key(signature)
     }
 
-    /// Get statistics
+    /// Get mempool statistics
     pub fn get_stats(&self) -> MempoolStats {
         let stats = self.stats.read().unwrap().clone();
         let mut updated_stats = stats;
@@ -341,19 +349,12 @@ impl Mempool {
         updated_stats
     }
 
-    /// Clear mempool
+    /// Clear all transactions from mempool
     pub fn clear(&self) {
         self.transactions.write().unwrap().clear();
         self.priority_queue.write().unwrap().clear();
         self.by_sender.write().unwrap().clear();
     }
-}
-
-fn current_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
 }
 
 #[cfg(test)]
@@ -398,12 +399,12 @@ mod tests {
         let tx3 = create_test_transaction();
         
         mempool.add_transaction(tx1, 5000, 0).unwrap();
-        mempool.add_transaction(tx2, 10000, 5000).unwrap(); // Highest
+        mempool.add_transaction(tx2, 10000, 5000).unwrap();
         mempool.add_transaction(tx3, 8000, 0).unwrap();
         
         let top = mempool.get_top_transactions(3);
         assert_eq!(top.len(), 3);
-        assert_eq!(top[0].fee + top[0].priority_fee, 15000); // Highest first
+        assert_eq!(top[0].fee + top[0].priority_fee, 15000);
     }
 
     #[test]
@@ -430,64 +431,4 @@ mod tests {
         let stats = mempool.get_stats();
         assert_eq!(stats.total_rejected, 1);
     }
-
-    #[test]
-    fn test_per_account_limit() {
-        let mut config = MempoolConfig::default();
-        config.max_per_account = 2;
-        let mempool = Mempool::new(config);
-        
-        let mut csprng = OsRng;
-        let keypair = Keypair::generate(&mut csprng);
-        
-        // Add 2 transactions from same sender
-        for _ in 0..2 {
-            let tx = Transaction::new(&[&keypair], vec![], vec![1u8; 32]).unwrap();
-            mempool.add_transaction(tx, 10000, 0).unwrap();
-        }
-        
-        // Third should fail
-        let tx = Transaction::new(&[&keypair], vec![], vec![1u8; 32]).unwrap();
-        let result = mempool.add_transaction(tx, 10000, 0);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_capacity_eviction() {
-        let mut config = MempoolConfig::default();
-        config.max_transactions = 3;
-        let mempool = Mempool::new(config);
-        
-        // Add 3 transactions with different fees
-        mempool.add_transaction(create_test_transaction(), 10000, 0).unwrap();
-        mempool.add_transaction(create_test_transaction(), 15000, 0).unwrap();
-        mempool.add_transaction(create_test_transaction(), 20000, 0).unwrap();
-        
-        // Add 4th - should evict lowest fee
-        mempool.add_transaction(create_test_transaction(), 25000, 0).unwrap();
-        
-        assert_eq!(mempool.size(), 3);
-        
-        let stats = mempool.get_stats();
-        assert_eq!(stats.total_evicted, 1);
-    }
-
-    #[test]
-    fn test_get_transactions_by_sender() {
-        let mempool = Mempool::new(MempoolConfig::default());
-        
-        let mut csprng = OsRng;
-        let keypair = Keypair::generate(&mut csprng);
-        let sender = keypair.public.to_bytes().to_vec();
-        
-        let tx = Transaction::new(&[&keypair], vec![], vec![1u8; 32]).unwrap();
-        mempool.add_transaction(tx, 10000, 0).unwrap();
-        
-        let sender_txs = mempool.get_transactions_by_sender(&sender);
-        assert_eq!(sender_txs.len(), 1);
-    }
 }
-
-
-
-

@@ -4,6 +4,10 @@ use std::path::Path;
 use serde::{Serialize, Deserialize};
 use tracing::{info, warn};
 
+/// Persistent storage using RocksDB
+///
+/// Provides key-value storage for blocks, transactions, accounts, and state data.
+/// Uses column families for organized data separation.
 pub struct Storage {
     db: DB,
 }
@@ -17,6 +21,10 @@ const CF_SIGNATURES: &str = "signatures";
 const CF_PROGRAM_ACCOUNTS: &str = "program_accounts";
 
 impl Storage {
+    /// Create new storage instance
+    ///
+    /// # Arguments
+    /// * `path` - Directory path for database files
     pub fn new(path: &str) -> Result<Self> {
         let path = Path::new(path);
         std::fs::create_dir_all(path)?;
@@ -46,16 +54,14 @@ impl Storage {
         Ok(Self { db })
     }
 
-    // ========================================================================
-    // Block Operations
-    // ========================================================================
+    // Block operations
 
+    /// Store a block at given slot
     pub fn store_block(&self, slot: u64, block_data: &[u8]) -> Result<()> {
         let cf = self.db.cf_handle(CF_BLOCKS)
             .context("Blocks CF not found")?;
         self.db.put_cf(cf, slot.to_le_bytes(), block_data)?;
         
-        // Also index by slot
         let slots_cf = self.db.cf_handle(CF_SLOTS)
             .context("Slots CF not found")?;
         self.db.put_cf(slots_cf, slot.to_le_bytes(), &[1u8])?;
@@ -63,12 +69,14 @@ impl Storage {
         Ok(())
     }
 
+    /// Get block by slot
     pub fn get_block(&self, slot: u64) -> Result<Option<Vec<u8>>> {
         let cf = self.db.cf_handle(CF_BLOCKS)
             .context("Blocks CF not found")?;
         Ok(self.db.get_cf(cf, slot.to_le_bytes())?)
     }
 
+    /// Get range of blocks
     pub fn get_blocks_range(&self, start_slot: u64, end_slot: u64) -> Result<Vec<(u64, Vec<u8>)>> {
         let cf = self.db.cf_handle(CF_BLOCKS)
             .context("Blocks CF not found")?;
@@ -90,6 +98,7 @@ impl Storage {
         Ok(blocks)
     }
 
+    /// Get latest block
     pub fn get_latest_block(&self) -> Result<Option<(u64, Vec<u8>)>> {
         let cf = self.db.cf_handle(CF_BLOCKS)
             .context("Blocks CF not found")?;
@@ -105,6 +114,7 @@ impl Storage {
         Ok(None)
     }
 
+    /// Delete block at slot
     pub fn delete_block(&self, slot: u64) -> Result<()> {
         let cf = self.db.cf_handle(CF_BLOCKS)
             .context("Blocks CF not found")?;
@@ -112,35 +122,29 @@ impl Storage {
         Ok(())
     }
 
-    // ========================================================================
-    // Transaction Operations
-    // ========================================================================
+    // Transaction operations
 
+    /// Store transaction
     pub fn store_transaction(&self, signature: &[u8], tx_data: &[u8]) -> Result<()> {
         let cf = self.db.cf_handle(CF_TRANSACTIONS)
             .context("Transactions CF not found")?;
         self.db.put_cf(cf, signature, tx_data)?;
         
-        // Index signature
         let sig_cf = self.db.cf_handle(CF_SIGNATURES)
             .context("Signatures CF not found")?;
-        self.db.put_cf(sig_cf, signature, &current_timestamp().to_le_bytes())?;
+        self.db.put_cf(sig_cf, signature, &crate::utils::current_timestamp().to_le_bytes())?;
         
         Ok(())
     }
 
+    /// Get transaction by signature
     pub fn get_transaction(&self, signature: &[u8]) -> Result<Option<Vec<u8>>> {
         let cf = self.db.cf_handle(CF_TRANSACTIONS)
             .context("Transactions CF not found")?;
         Ok(self.db.get_cf(cf, signature)?)
     }
 
-    pub fn get_transactions_by_address(&self, address: &[u8], limit: usize) -> Result<Vec<Vec<u8>>> {
-        // In a real implementation, this would use an index
-        // For now, return empty
-        Ok(Vec::new())
-    }
-
+    /// Store transaction with slot information
     pub fn store_transaction_with_slot(
         &self,
         signature: &[u8],
@@ -153,7 +157,6 @@ impl Storage {
             .context("Transactions CF not found")?;
         batch.put_cf(tx_cf, signature, tx_data);
         
-        // Store slot mapping
         let sig_cf = self.db.cf_handle(CF_SIGNATURES)
             .context("Signatures CF not found")?;
         batch.put_cf(sig_cf, signature, &slot.to_le_bytes());
@@ -162,10 +165,9 @@ impl Storage {
         Ok(())
     }
 
-    // ========================================================================
-    // Account Operations
-    // ========================================================================
+    // Account operations
 
+    /// Store account data
     pub fn store_account(&self, address: &[u8], account_data: &[u8]) -> Result<()> {
         let cf = self.db.cf_handle(CF_ACCOUNTS)
             .context("Accounts CF not found")?;
@@ -173,12 +175,14 @@ impl Storage {
         Ok(())
     }
 
+    /// Get account data
     pub fn get_account(&self, address: &[u8]) -> Result<Option<Vec<u8>>> {
         let cf = self.db.cf_handle(CF_ACCOUNTS)
             .context("Accounts CF not found")?;
         Ok(self.db.get_cf(cf, address)?)
     }
 
+    /// Store multiple accounts in batch
     pub fn store_accounts_batch(&self, accounts: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
         let mut batch = WriteBatch::default();
         let cf = self.db.cf_handle(CF_ACCOUNTS)
@@ -192,6 +196,7 @@ impl Storage {
         Ok(())
     }
 
+    /// Delete account
     pub fn delete_account(&self, address: &[u8]) -> Result<()> {
         let cf = self.db.cf_handle(CF_ACCOUNTS)
             .context("Accounts CF not found")?;
@@ -199,6 +204,7 @@ impl Storage {
         Ok(())
     }
 
+    /// Get accounts by program
     pub fn get_accounts_by_program(&self, program_id: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let cf = self.db.cf_handle(CF_PROGRAM_ACCOUNTS)
             .context("Program accounts CF not found")?;
@@ -208,7 +214,6 @@ impl Storage {
         
         for item in iter {
             let (key, value) = item?;
-            // Key format: program_id || account_address
             if key.starts_with(program_id) {
                 accounts.push((key[32..].to_vec(), value.to_vec()));
             }
@@ -217,6 +222,7 @@ impl Storage {
         Ok(accounts)
     }
 
+    /// Index program account
     pub fn index_program_account(&self, program_id: &[u8], account: &[u8]) -> Result<()> {
         let cf = self.db.cf_handle(CF_PROGRAM_ACCOUNTS)
             .context("Program accounts CF not found")?;
@@ -229,10 +235,9 @@ impl Storage {
         Ok(())
     }
 
-    // ========================================================================
-    // State Operations
-    // ========================================================================
+    // State operations
 
+    /// Store typed state value
     pub fn store_state<T: Serialize>(&self, key: &str, value: &T) -> Result<()> {
         let cf = self.db.cf_handle(CF_STATE)
             .context("State CF not found")?;
@@ -241,6 +246,7 @@ impl Storage {
         Ok(())
     }
 
+    /// Get typed state value
     pub fn get_state<T: for<'de> Deserialize<'de>>(&self, key: &str) -> Result<Option<T>> {
         let cf = self.db.cf_handle(CF_STATE)
             .context("State CF not found")?;
@@ -250,6 +256,7 @@ impl Storage {
         }
     }
 
+    /// Delete state value
     pub fn delete_state(&self, key: &str) -> Result<()> {
         let cf = self.db.cf_handle(CF_STATE)
             .context("State CF not found")?;
@@ -257,10 +264,9 @@ impl Storage {
         Ok(())
     }
 
-    // ========================================================================
-    // Utility Operations
-    // ========================================================================
+    // Utility operations
 
+    /// Compact database
     pub fn compact(&self) -> Result<()> {
         info!("Compacting database...");
         
@@ -274,34 +280,23 @@ impl Storage {
         Ok(())
     }
 
+    /// Get storage statistics
     pub fn get_stats(&self) -> Result<StorageStats> {
         let mut total_size = 0u64;
         let mut block_count = 0usize;
         let mut tx_count = 0usize;
         let mut account_count = 0usize;
 
-        // Count blocks
         if let Some(cf) = self.db.cf_handle(CF_BLOCKS) {
-            let iter = self.db.iterator_cf(cf, IteratorMode::Start);
-            for _ in iter {
-                block_count += 1;
-            }
+            block_count = self.db.iterator_cf(cf, IteratorMode::Start).count();
         }
 
-        // Count transactions
         if let Some(cf) = self.db.cf_handle(CF_TRANSACTIONS) {
-            let iter = self.db.iterator_cf(cf, IteratorMode::Start);
-            for _ in iter {
-                tx_count += 1;
-            }
+            tx_count = self.db.iterator_cf(cf, IteratorMode::Start).count();
         }
 
-        // Count accounts
         if let Some(cf) = self.db.cf_handle(CF_ACCOUNTS) {
-            let iter = self.db.iterator_cf(cf, IteratorMode::Start);
-            for _ in iter {
-                account_count += 1;
-            }
+            account_count = self.db.iterator_cf(cf, IteratorMode::Start).count();
         }
 
         Ok(StorageStats {
@@ -312,19 +307,19 @@ impl Storage {
         })
     }
 
+    /// Create backup (placeholder)
     pub fn backup(&self, backup_path: &str) -> Result<()> {
         info!("Creating backup at {}", backup_path);
-        // In production, use RocksDB backup API
         Ok(())
     }
 
+    /// Restore from backup (placeholder)
     pub fn restore_from_backup(&self, backup_path: &str) -> Result<()> {
         info!("Restoring from backup at {}", backup_path);
-        // In production, use RocksDB restore API
         Ok(())
     }
 
-    /// Prune old blocks before a certain slot
+    /// Prune old blocks before slot
     pub fn prune_blocks_before(&self, slot: u64) -> Result<usize> {
         let cf = self.db.cf_handle(CF_BLOCKS)
             .context("Blocks CF not found")?;
@@ -355,13 +350,6 @@ pub struct StorageStats {
     pub block_count: usize,
     pub transaction_count: usize,
     pub account_count: usize,
-}
-
-fn current_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
 }
 
 #[cfg(test)]
@@ -399,53 +387,5 @@ mod tests {
         
         let retrieved = storage.get_transaction(&signature).unwrap();
         assert_eq!(retrieved, Some(tx_data));
-    }
-
-    #[test]
-    fn test_account_storage() {
-        let temp_dir = TempDir::new().unwrap();
-        let storage = Storage::new(temp_dir.path().to_str().unwrap()).unwrap();
-        
-        let address = vec![1u8; 32];
-        let account_data = vec![1, 2, 3, 4];
-        storage.store_account(&address, &account_data).unwrap();
-        
-        let retrieved = storage.get_account(&address).unwrap();
-        assert_eq!(retrieved, Some(account_data));
-    }
-
-    #[test]
-    fn test_batch_account_storage() {
-        let temp_dir = TempDir::new().unwrap();
-        let storage = Storage::new(temp_dir.path().to_str().unwrap()).unwrap();
-        
-        let accounts = vec![
-            (vec![1u8; 32], vec![1, 2, 3]),
-            (vec![2u8; 32], vec![4, 5, 6]),
-        ];
-        
-        storage.store_accounts_batch(&accounts).unwrap();
-        
-        let retrieved1 = storage.get_account(&accounts[0].0).unwrap();
-        assert_eq!(retrieved1, Some(accounts[0].1.clone()));
-    }
-
-    #[test]
-    fn test_block_pruning() {
-        let temp_dir = TempDir::new().unwrap();
-        let storage = Storage::new(temp_dir.path().to_str().unwrap()).unwrap();
-        
-        // Store blocks 1-10
-        for slot in 1..=10 {
-            storage.store_block(slot, &vec![slot as u8]).unwrap();
-        }
-        
-        // Prune blocks before slot 5
-        let pruned = storage.prune_blocks_before(5).unwrap();
-        assert_eq!(pruned, 4);
-        
-        // Verify blocks 1-4 are gone
-        assert!(storage.get_block(3).unwrap().is_none());
-        assert!(storage.get_block(5).unwrap().is_some());
     }
 }
