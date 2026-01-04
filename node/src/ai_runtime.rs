@@ -418,8 +418,9 @@ impl AIRuntime {
             })?;
         
         // 4. Execute using the REAL model - no simulation fallback
+        // Pass Arc<OnnxModel> for thread-safe sharing in spawn_blocking
         let (output, execution_cost) = self.execute_with_real_model(
-            &model, 
+            model, 
             input_data, 
             &agent.config, 
             max_compute - compute_used
@@ -439,70 +440,107 @@ impl AIRuntime {
     }
 
     /// Execute inference with a real loaded ONNX model
+    /// 
+    /// CRITICAL: Uses tokio::task::spawn_blocking to offload heavy CPU-bound
+    /// inference to a dedicated thread pool. This prevents blocking the async
+    /// runtime's event loop, which would otherwise cause:
+    /// - Missed network heartbeats/pings
+    /// - Delayed block/vote processing
+    /// - Potential consensus timeouts
+    /// - Node appearing "dead" to peers
     async fn execute_with_real_model(
         &self,
-        model: &OnnxModel,
+        model: Arc<OnnxModel>,
         input_data: &[u8],
         config: &AgentConfig,
         remaining_compute: u64,
     ) -> Result<(Vec<u8>, u64)> {
         let start_time = std::time::Instant::now();
         
-        // Parse input based on model type
-        let output_data = match config.model_type.as_str() {
-            "transformer" | "embeddings" => {
-                // Text input - use infer_text
-                let input_text = String::from_utf8_lossy(input_data);
-                let max_length = config.parameters.get("maxTokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(512) as usize;
-                
-                let output = model.infer_text(&input_text, max_length)?;
-                
-                serde_json::json!({
-                    "model": config.model_type,
-                    "input_length": input_text.len(),
-                    "output_shape": [output.len()],
-                    "output": output,
-                    "timestamp": current_timestamp(),
-                    "inference_type": "real"
-                }).to_string().into_bytes()
-            }
-            "cnn" | "rnn" | _ => {
-                // Binary/tensor input - convert to float array
-                let input_floats: Vec<f32> = input_data.iter()
-                    .map(|&b| b as f32 / 255.0) // Normalize to [0, 1]
-                    .collect();
-                
-                let input_shape = IxDyn(&[1, input_floats.len()]);
-                let input_array = ArrayD::from_shape_vec(input_shape, input_floats)
-                    .context("Failed to create input tensor")?;
-                
-                let outputs = model.infer(input_array)?;
-                
-                let output_vecs: Vec<Vec<f32>> = outputs.iter()
-                    .map(|arr| arr.iter().cloned().collect())
-                    .collect();
-                
-                serde_json::json!({
-                    "model": config.model_type,
-                    "input_size": input_data.len(),
-                    "output_count": outputs.len(),
-                    "outputs": output_vecs,
-                    "timestamp": current_timestamp(),
-                    "inference_type": "real"
-                }).to_string().into_bytes()
-            }
-        };
+        // Clone data for the blocking task
+        let model_type = config.model_type.clone();
+        let max_tokens = config.parameters.get("maxTokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(512) as usize;
+        let input_bytes = input_data.to_vec();
         
+        // The model is already Arc-wrapped, clone the Arc for the blocking task
+        let model_clone = model;
+        
+        // CRITICAL FIX: Offload CPU-intensive inference to blocking thread pool
+        // This prevents the async runtime from being blocked during model execution
+        let inference_result = tokio::task::spawn_blocking(move || {
+            let inference_start = std::time::Instant::now();
+            
+            let output_data = match model_type.as_str() {
+                "transformer" | "embeddings" => {
+                    // Text input - use infer_text
+                    let input_text = String::from_utf8_lossy(&input_bytes);
+                    
+                    let output = model_clone.infer_text(&input_text, max_tokens)?;
+                    
+                    Ok::<Vec<u8>, anyhow::Error>(serde_json::json!({
+                        "model": model_type,
+                        "input_length": input_text.len(),
+                        "output_shape": [output.len()],
+                        "output": output,
+                        "timestamp": std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs(),
+                        "inference_type": "real",
+                        "execution_thread": "blocking_pool"
+                    }).to_string().into_bytes())
+                }
+                "cnn" | "rnn" | _ => {
+                    // Binary/tensor input - convert to float array
+                    let input_floats: Vec<f32> = input_bytes.iter()
+                        .map(|&b| b as f32 / 255.0) // Normalize to [0, 1]
+                        .collect();
+                    
+                    let input_shape = IxDyn(&[1, input_floats.len()]);
+                    let input_array = ArrayD::from_shape_vec(input_shape, input_floats)
+                        .context("Failed to create input tensor")?;
+                    
+                    let outputs = model_clone.infer(input_array)?;
+                    
+                    let output_vecs: Vec<Vec<f32>> = outputs.iter()
+                        .map(|arr| arr.iter().cloned().collect())
+                        .collect();
+                    
+                    Ok(serde_json::json!({
+                        "model": model_type,
+                        "input_size": input_bytes.len(),
+                        "output_count": outputs.len(),
+                        "outputs": output_vecs,
+                        "timestamp": std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs(),
+                        "inference_type": "real",
+                        "execution_thread": "blocking_pool"
+                    }).to_string().into_bytes())
+                }
+            };
+            
+            let inference_time_us = inference_start.elapsed().as_micros() as u64;
+            output_data.map(|data| (data, inference_time_us))
+        })
+        .await
+        .context("Inference task panicked")?
+        .context("Inference execution failed")?;
+        
+        let (output_data, inference_time_us) = inference_result;
         let execution_time_ms = start_time.elapsed().as_millis() as u64;
         
         // Compute cost based on actual execution time
         // 1 compute unit per microsecond
-        let compute_cost = (start_time.elapsed().as_micros() as u64)
-            .min(remaining_compute);
+        let compute_cost = inference_time_us.min(remaining_compute);
         
-        info!("Real model inference completed in {}ms, compute cost: {}", execution_time_ms, compute_cost);
+        info!(
+            "Model inference completed in {}ms ({}μs in blocking pool), compute cost: {}",
+            execution_time_ms, inference_time_us, compute_cost
+        );
         
         Ok((output_data, compute_cost))
     }
