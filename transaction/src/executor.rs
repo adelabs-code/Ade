@@ -341,7 +341,7 @@ impl InstructionExecutor {
         })
     }
 
-    /// Execute bridge deposit instruction
+    /// Execute bridge deposit instruction - mints wrapped tokens to recipient
     fn execute_bridge_deposit(
         &self,
         from_chain: &str,
@@ -350,20 +350,76 @@ impl InstructionExecutor {
         accounts: &[AccountMeta],
         context: &mut ExecutionContext,
     ) -> Result<ExecutionResult> {
-        context.log(format!("Bridge deposit from {} of {} tokens", from_chain, amount));
+        if accounts.is_empty() {
+            return Err(anyhow::anyhow!("No accounts provided for bridge deposit"));
+        }
+
+        // Validate amount
+        if amount == 0 {
+            return Err(anyhow::anyhow!("Deposit amount cannot be zero"));
+        }
+
+        let recipient_key = &accounts[0].pubkey;
+        context.log(format!(
+            "Bridge deposit from {} of {} tokens to {}",
+            from_chain,
+            amount,
+            bs58::encode(recipient_key).into_string()
+        ));
+
+        let mut accounts_map = self.accounts.write().unwrap();
+        let mut modified_accounts = Vec::new();
+
+        // Get or create the wrapped token account for the recipient
+        // The wrapped token account key is derived from token_address and recipient
+        let wrapped_token_key = self.derive_wrapped_token_key(token_address, recipient_key);
         
-        // In a real implementation, this would interact with bridge contracts
+        // Create bridge escrow account if needed (holds the proof of deposit)
+        let bridge_escrow_key = self.derive_bridge_escrow_key(from_chain);
+        
+        // Get or create recipient's wrapped token account
+        let recipient_account = accounts_map.entry(recipient_key.clone())
+            .or_insert_with(|| Account::new(0, vec![]));
+        
+        // Mint wrapped tokens by increasing lamports (representing wrapped token balance)
+        // In production, this would update a token account's data field
+        recipient_account.lamports += amount;
+        modified_accounts.push(recipient_key.clone());
+        
+        context.log(format!("Minted {} wrapped tokens to recipient", amount));
+        context.log(format!("New recipient balance: {}", recipient_account.lamports));
+
+        // Update or create bridge deposit record
+        let deposit_record_key = self.derive_deposit_record_key(token_address, context.slot);
+        let deposit_record = accounts_map.entry(deposit_record_key.clone())
+            .or_insert_with(|| Account::new(0, vec![]));
+        
+        // Store deposit metadata in account data
+        deposit_record.data = bincode::serialize(&BridgeDepositRecord {
+            from_chain: from_chain.to_string(),
+            token_address: token_address.to_vec(),
+            amount,
+            recipient: recipient_key.clone(),
+            slot: context.slot,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        })?;
+        modified_accounts.push(deposit_record_key);
+
+        context.log("Bridge deposit completed successfully".to_string());
         
         Ok(ExecutionResult {
             success: true,
             compute_units_consumed: 5000,
             logs: context.logs.clone(),
             error: None,
-            modified_accounts: vec![],
+            modified_accounts,
         })
     }
 
-    /// Execute bridge withdraw instruction
+    /// Execute bridge withdraw instruction - burns wrapped tokens and initiates unlock
     fn execute_bridge_withdraw(
         &self,
         to_chain: &str,
@@ -372,18 +428,151 @@ impl InstructionExecutor {
         accounts: &[AccountMeta],
         context: &mut ExecutionContext,
     ) -> Result<ExecutionResult> {
-        context.log(format!("Bridge withdraw to {} of {} tokens", to_chain, amount));
+        if accounts.is_empty() {
+            return Err(anyhow::anyhow!("No accounts provided for bridge withdrawal"));
+        }
+
+        // Validate amount
+        if amount == 0 {
+            return Err(anyhow::anyhow!("Withdrawal amount cannot be zero"));
+        }
+
+        let sender_key = &accounts[0].pubkey;
+        context.log(format!(
+            "Bridge withdraw to {} of {} tokens from {}",
+            to_chain,
+            amount,
+            bs58::encode(sender_key).into_string()
+        ));
+
+        let mut accounts_map = self.accounts.write().unwrap();
+        let mut modified_accounts = Vec::new();
+
+        // Get sender's account
+        let sender_account = accounts_map.get_mut(sender_key)
+            .ok_or_else(|| anyhow::anyhow!("Sender account not found"))?;
+
+        // Check sender has sufficient balance
+        if sender_account.lamports < amount {
+            return Err(anyhow::anyhow!(
+                "Insufficient balance for withdrawal: {} < {}",
+                sender_account.lamports,
+                amount
+            ));
+        }
+
+        // Burn wrapped tokens by deducting from sender's balance
+        sender_account.lamports -= amount;
+        modified_accounts.push(sender_key.clone());
         
-        // In a real implementation, this would interact with bridge contracts
+        context.log(format!("Burned {} wrapped tokens from sender", amount));
+        context.log(format!("Sender remaining balance: {}", sender_account.lamports));
+
+        // Create withdrawal record for the relayer to process
+        let withdrawal_record_key = self.derive_withdrawal_record_key(sender_key, context.slot);
+        let mut withdrawal_record = Account::new(0, vec![]);
+        
+        withdrawal_record.data = bincode::serialize(&BridgeWithdrawalRecord {
+            to_chain: to_chain.to_string(),
+            amount,
+            sender: sender_key.clone(),
+            recipient: recipient.to_vec(),
+            slot: context.slot,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            status: WithdrawalStatus::Pending,
+        })?;
+        
+        accounts_map.insert(withdrawal_record_key.clone(), withdrawal_record);
+        modified_accounts.push(withdrawal_record_key);
+
+        context.log(format!(
+            "Withdrawal initiated to {} on {}",
+            bs58::encode(recipient).into_string(),
+            to_chain
+        ));
         
         Ok(ExecutionResult {
             success: true,
             compute_units_consumed: 5000,
             logs: context.logs.clone(),
             error: None,
-            modified_accounts: vec![],
+            modified_accounts,
         })
     }
+
+    /// Derive wrapped token account key
+    fn derive_wrapped_token_key(&self, token_address: &[u8], owner: &[u8]) -> Vec<u8> {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(b"wrapped_token");
+        hasher.update(token_address);
+        hasher.update(owner);
+        hasher.finalize().to_vec()
+    }
+
+    /// Derive bridge escrow account key
+    fn derive_bridge_escrow_key(&self, chain: &str) -> Vec<u8> {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(b"bridge_escrow");
+        hasher.update(chain.as_bytes());
+        hasher.finalize().to_vec()
+    }
+
+    /// Derive deposit record key
+    fn derive_deposit_record_key(&self, token_address: &[u8], slot: u64) -> Vec<u8> {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(b"deposit_record");
+        hasher.update(token_address);
+        hasher.update(&slot.to_le_bytes());
+        hasher.finalize().to_vec()
+    }
+
+    /// Derive withdrawal record key
+    fn derive_withdrawal_record_key(&self, sender: &[u8], slot: u64) -> Vec<u8> {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(b"withdrawal_record");
+        hasher.update(sender);
+        hasher.update(&slot.to_le_bytes());
+        hasher.finalize().to_vec()
+    }
+}
+
+/// Record of a bridge deposit
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BridgeDepositRecord {
+    pub from_chain: String,
+    pub token_address: Vec<u8>,
+    pub amount: u64,
+    pub recipient: Vec<u8>,
+    pub slot: u64,
+    pub timestamp: u64,
+}
+
+/// Record of a bridge withdrawal
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BridgeWithdrawalRecord {
+    pub to_chain: String,
+    pub amount: u64,
+    pub sender: Vec<u8>,
+    pub recipient: Vec<u8>,
+    pub slot: u64,
+    pub timestamp: u64,
+    pub status: WithdrawalStatus,
+}
+
+/// Status of a bridge withdrawal
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub enum WithdrawalStatus {
+    Pending,
+    Processing,
+    Completed,
+    Failed,
 }
 
 /// Transaction executor
@@ -509,5 +698,8 @@ mod tests {
         assert!(result.is_err());
     }
 }
+
+
+
 
 
