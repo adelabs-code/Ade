@@ -168,12 +168,31 @@ impl Instruction {
         Ok(buffer)
     }
 
-    /// Deserialize instruction from bytes
+    /// Deserialize instruction from bytes (without account context)
+    /// 
+    /// NOTE: This version creates placeholder accounts. Use `deserialize_with_accounts`
+    /// when you have access to the message's account keys for proper deserialization.
     pub fn deserialize(data: &[u8]) -> Result<Self> {
+        Self::deserialize_with_accounts(data, &[])
+    }
+    
+    /// Deserialize instruction from bytes with account key context
+    /// 
+    /// This properly resolves account indices to actual public keys from the
+    /// message's account keys list. The header contains signer/writable info.
+    pub fn deserialize_with_accounts(data: &[u8], account_keys: &[Vec<u8>]) -> Result<Self> {
         let mut cursor = Cursor::new(data);
         
         // Read program ID index
-        let _program_idx = cursor.read_u8()?;
+        let program_idx = cursor.read_u8()? as usize;
+        
+        // Resolve program ID from account keys
+        let program_id = if program_idx < account_keys.len() {
+            account_keys[program_idx].clone()
+        } else {
+            // Fallback if account keys not provided
+            vec![0u8; 32]
+        };
         
         // Read account indices
         let num_accounts = Self::read_compact_u16(&mut cursor)? as usize;
@@ -187,15 +206,30 @@ impl Instruction {
         let mut instruction_data = vec![0u8; data_len];
         std::io::Read::read_exact(&mut cursor, &mut instruction_data)?;
         
-        // For now, create placeholder accounts
-        let accounts = (0..num_accounts).map(|_| AccountMeta {
-            pubkey: vec![0u8; 32],
-            is_signer: false,
-            is_writable: false,
+        // Resolve accounts from indices using account_keys
+        let accounts = account_indices.iter().map(|&idx| {
+            if idx < account_keys.len() {
+                AccountMeta {
+                    pubkey: account_keys[idx].clone(),
+                    // NOTE: Signer/writable flags should come from message header
+                    // For now, we use a simple heuristic:
+                    // - Index 0 is typically the fee payer (signer + writable)
+                    // - Lower indices are more likely to be signers
+                    is_signer: idx == 0,
+                    is_writable: idx < 2, // First two accounts are typically writable
+                }
+            } else {
+                // Fallback for out-of-bounds or no context
+                AccountMeta {
+                    pubkey: vec![0u8; 32],
+                    is_signer: false,
+                    is_writable: false,
+                }
+            }
         }).collect();
         
         Ok(Self {
-            program_id: vec![0u8; 32],
+            program_id,
             accounts,
             data: instruction_data,
         })

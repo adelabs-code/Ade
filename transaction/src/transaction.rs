@@ -295,7 +295,11 @@ impl Message {
         let mut offset = 0;
         
         for _ in 0..num_instructions {
-            let instruction = crate::instruction::Instruction::deserialize(&remaining[offset..])?;
+            // Use deserialize_with_accounts to properly resolve account indices
+            let instruction = crate::instruction::Instruction::deserialize_with_accounts(
+                &remaining[offset..],
+                &account_keys
+            )?;
             offset += instruction.serialized_size();
             instructions.push(instruction);
         }
