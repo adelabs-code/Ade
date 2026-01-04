@@ -16,6 +16,10 @@ pub struct RelayerConfig {
     pub max_concurrent_relays: usize,
     pub solana_rpc_url: String,
     pub ade_rpc_url: String,
+    /// Path to the relayer's Ed25519 keypair file
+    /// REQUIRED for signing bridge proofs - no mock signatures allowed
+    #[serde(default)]
+    pub keypair_path: Option<String>,
 }
 
 pub struct Relayer {
@@ -30,6 +34,9 @@ pub struct Relayer {
     last_solana_signature: Arc<RwLock<Option<String>>>,
     /// Last processed Ade block number
     last_ade_block: Arc<RwLock<u64>>,
+    /// Ed25519 keypair for signing proofs
+    /// REQUIRED for production - proofs without valid signatures are rejected
+    relayer_keypair: Option<ed25519_dalek::Keypair>,
 }
 
 struct RpcClients {
@@ -72,13 +79,51 @@ pub struct RelayerStats {
 }
 
 impl Relayer {
-    pub fn new(config: RelayerConfig) -> Self {
+    /// Create a new Relayer
+    /// 
+    /// IMPORTANT: For production, keypair_path should be configured in RelayerConfig.
+    /// Without a valid keypair, proof signing will fail and relaying will not work.
+    pub fn new(config: RelayerConfig) -> Result<Self> {
         let rpc_clients = RpcClients {
             solana: reqwest::Client::new(),
             ade: reqwest::Client::new(),
         };
 
-        Self {
+        // Load keypair from file if configured
+        let relayer_keypair = if let Some(ref path) = config.keypair_path {
+            let keypair_bytes = std::fs::read(path)
+                .map_err(|e| anyhow::anyhow!("Failed to read keypair file '{}': {}", path, e))?;
+            
+            let keypair = if keypair_bytes.len() == 64 {
+                ed25519_dalek::Keypair::from_bytes(&keypair_bytes)
+                    .map_err(|e| anyhow::anyhow!("Invalid keypair format: {}", e))?
+            } else if keypair_bytes.len() == 32 {
+                // Only secret key provided
+                let secret = ed25519_dalek::SecretKey::from_bytes(&keypair_bytes)
+                    .map_err(|e| anyhow::anyhow!("Invalid secret key: {}", e))?;
+                let public = ed25519_dalek::PublicKey::from(&secret);
+                ed25519_dalek::Keypair { secret, public }
+            } else {
+                return Err(anyhow::anyhow!(
+                    "Invalid keypair file length: expected 32 or 64 bytes, got {}",
+                    keypair_bytes.len()
+                ));
+            };
+            
+            info!(
+                "Relayer keypair loaded: {}",
+                bs58::encode(keypair.public.as_bytes()).into_string()
+            );
+            Some(keypair)
+        } else {
+            warn!(
+                "No keypair configured for relayer. Proof signing will fail. \
+                Set keypair_path in RelayerConfig for production use."
+            );
+            None
+        };
+
+        Ok(Self {
             config,
             running: Arc::new(RwLock::new(false)),
             pending_relays: Arc::new(RwLock::new(VecDeque::new())),
@@ -93,7 +138,18 @@ impl Relayer {
             rpc_clients,
             last_solana_signature: Arc::new(RwLock::new(None)),
             last_ade_block: Arc::new(RwLock::new(0)),
-        }
+            relayer_keypair,
+        })
+    }
+    
+    /// Check if the relayer has a valid keypair for signing
+    pub fn has_keypair(&self) -> bool {
+        self.relayer_keypair.is_some()
+    }
+    
+    /// Get the relayer's public key (if keypair is configured)
+    pub fn get_public_key(&self) -> Option<Vec<u8>> {
+        self.relayer_keypair.as_ref().map(|kp| kp.public.to_bytes().to_vec())
     }
     
     /// Get the last processed Solana signature
@@ -125,13 +181,20 @@ impl Relayer {
         }
 
         info!("Starting relayer with poll interval {}ms", self.config.poll_interval_ms);
+        
+        if self.relayer_keypair.is_none() {
+            warn!("Relayer starting without keypair - proof signing will fail!");
+        }
+        
+        // Get keypair bytes for spawning (Keypair doesn't implement Clone)
+        let keypair_bytes = self.relayer_keypair.as_ref().map(|kp| kp.to_bytes().to_vec());
 
         let mut handles = vec![];
 
         let poll_handle = self.spawn_polling_task();
         handles.push(poll_handle);
 
-        let relay_handle = self.spawn_relay_task();
+        let relay_handle = self.spawn_relay_task(keypair_bytes);
         handles.push(relay_handle);
 
         let cleanup_handle = self.spawn_cleanup_task();
@@ -197,7 +260,7 @@ impl Relayer {
         })
     }
 
-    fn spawn_relay_task(&self) -> tokio::task::JoinHandle<()> {
+    fn spawn_relay_task(&self, keypair_bytes: Option<Vec<u8>>) -> tokio::task::JoinHandle<()> {
         let config = self.config.clone();
         let running = self.running.clone();
         let pending_relays = self.pending_relays.clone();
@@ -208,6 +271,15 @@ impl Relayer {
         };
 
         tokio::spawn(async move {
+            // Reconstruct keypair inside the task
+            let relayer_keypair = keypair_bytes.and_then(|bytes| {
+                ed25519_dalek::Keypair::from_bytes(&bytes).ok()
+            });
+            
+            if relayer_keypair.is_none() {
+                warn!("Relay task started without keypair - proof signing will fail");
+            }
+            
             let mut process_timer = interval(Duration::from_millis(100));
 
             while *running.read().unwrap() {
@@ -227,7 +299,14 @@ impl Relayer {
                 };
 
                 for task in tasks_to_process {
-                    if let Err(e) = process_relay_task(&config, &rpc_clients, task, &pending_relays, &stats).await {
+                    if let Err(e) = process_relay_task(
+                        &config, 
+                        &rpc_clients, 
+                        task, 
+                        &pending_relays, 
+                        &stats,
+                        relayer_keypair.as_ref(),
+                    ).await {
                         error!("Error processing relay task: {}", e);
                     }
                 }
@@ -530,6 +609,7 @@ async fn process_relay_task(
     mut task: RelayTask,
     pending_relays: &Arc<RwLock<VecDeque<RelayTask>>>,
     stats: &Arc<RwLock<RelayerStats>>,
+    relayer_keypair: Option<&ed25519_dalek::Keypair>,
 ) -> Result<()> {
     let start_time = std::time::Instant::now();
 
@@ -538,7 +618,7 @@ async fn process_relay_task(
 
     let result = match (&task.source_chain.as_str(), &task.target_chain.as_str()) {
         ("solana", "ade") => relay_to_ade(config, rpc_clients, &task).await,
-        ("ade", "solana") => relay_to_solana(config, rpc_clients, &task).await,
+        ("ade", "solana") => relay_to_solana(config, rpc_clients, &task, relayer_keypair).await,
         _ => Err(anyhow::anyhow!("Unsupported chain pair")),
     };
 
@@ -633,11 +713,12 @@ async fn relay_to_solana(
     config: &RelayerConfig,
     rpc_clients: &RpcClients,
     task: &RelayTask,
+    relayer_keypair: Option<&ed25519_dalek::Keypair>,
 ) -> Result<()> {
     info!("Relaying withdrawal from Ade to Solana");
 
-    // Similar implementation to relay_to_ade but in reverse
-    let proof = generate_withdrawal_proof(task)?;
+    // Generate withdrawal proof with valid signature (REQUIRES keypair)
+    let proof = generate_withdrawal_proof(task, relayer_keypair)?;
 
     let request = serde_json::json!({
         "jsonrpc": "2.0",
@@ -750,8 +831,9 @@ async fn generate_deposit_proof_async(
     };
     
     // Create and sign the proof message
+    // SECURITY: This requires a valid keypair - no mock signatures allowed
     let proof_message = create_proof_message(&task.id, task.block_number, &task.data);
-    let relayer_signature = sign_proof_message_with_key(&proof_message, relayer_keypair);
+    let relayer_signature = sign_proof_message_with_key(&proof_message, relayer_keypair)?;
 
     Ok(BridgeProof {
         source_chain: task.source_chain.clone(),
@@ -764,7 +846,10 @@ async fn generate_deposit_proof_async(
 }
 
 /// Synchronous wrapper for generate_deposit_proof_async
-fn generate_deposit_proof(task: &RelayTask) -> Result<BridgeProof> {
+/// 
+/// SECURITY: This function now requires a keypair parameter.
+/// Proofs without valid signatures are rejected by the bridge.
+fn generate_deposit_proof(task: &RelayTask, relayer_keypair: Option<&ed25519_dalek::Keypair>) -> Result<BridgeProof> {
     use sha2::{Sha256, Digest};
     
     // Generate event hash
@@ -777,9 +862,9 @@ fn generate_deposit_proof(task: &RelayTask) -> Result<BridgeProof> {
     // Use computed merkle proof (sync version)
     let merkle_proof = build_merkle_path_for_event(&task.id, &event_hash, task.block_number);
     
-    // Sign the proof
+    // Sign the proof - REQUIRES valid keypair
     let proof_message = create_proof_message(&task.id, task.block_number, &task.data);
-    let relayer_signature = sign_proof_message(&proof_message);
+    let relayer_signature = sign_proof_message_with_key(&proof_message, relayer_keypair)?;
 
     Ok(BridgeProof {
         source_chain: task.source_chain.clone(),
@@ -792,7 +877,9 @@ fn generate_deposit_proof(task: &RelayTask) -> Result<BridgeProof> {
 }
 
 /// Generate withdrawal proof with Merkle path from event data
-fn generate_withdrawal_proof(task: &RelayTask) -> Result<BridgeProof> {
+/// 
+/// SECURITY: Requires valid keypair for signing. No mock signatures.
+fn generate_withdrawal_proof(task: &RelayTask, relayer_keypair: Option<&ed25519_dalek::Keypair>) -> Result<BridgeProof> {
     use sha2::{Sha256, Digest};
     
     let event_hash = {
@@ -804,9 +891,9 @@ fn generate_withdrawal_proof(task: &RelayTask) -> Result<BridgeProof> {
     // Build Merkle proof for withdrawal event
     let merkle_proof = build_merkle_path_for_event(&task.id, &event_hash, task.block_number);
     
-    // Sign the proof
+    // Sign the proof - REQUIRES valid keypair
     let proof_message = create_proof_message(&task.id, task.block_number, &task.data);
-    let relayer_signature = sign_proof_message(&proof_message);
+    let relayer_signature = sign_proof_message_with_key(&proof_message, relayer_keypair)?;
 
     Ok(BridgeProof {
         source_chain: task.source_chain.clone(),
@@ -1035,52 +1122,49 @@ fn create_proof_message(tx_hash: &[u8], block_number: u64, event_data: &[u8]) ->
 }
 
 /// Sign a proof message with actual Ed25519 signing
-fn sign_proof_message_with_key(message: &[u8], keypair: Option<&ed25519_dalek::Keypair>) -> RelayerSignature {
+/// 
+/// SECURITY: This function REQUIRES a valid keypair. No mock signatures allowed.
+/// Mock signatures would allow anyone to forge bridge proofs.
+fn sign_proof_message_with_key(message: &[u8], keypair: Option<&ed25519_dalek::Keypair>) -> Result<RelayerSignature> {
     use ed25519_dalek::Signer;
     
     match keypair {
         Some(kp) => {
             // Use actual Ed25519 signing
             let signature = kp.sign(message);
-            RelayerSignature {
+            Ok(RelayerSignature {
                 relayer_pubkey: kp.public.to_bytes().to_vec(),
                 signature: signature.to_bytes().to_vec(),
-            }
+            })
         }
         None => {
-            // Fallback for testing - generate deterministic mock signature
-            // This should NOT be used in production
-            warn!("Using mock signature - no keypair provided");
-            sign_proof_message(message)
+            // NO MOCK SIGNATURES - this is a security requirement
+            error!("Cannot sign proof: no keypair provided. Relayer must have a valid keypair configured.");
+            Err(anyhow::anyhow!(
+                "Relayer keypair not configured. Bridge operations require valid Ed25519 signing. \
+                Please configure RELAYER_KEYPAIR_PATH in the relayer configuration."
+            ))
         }
     }
 }
 
-/// Fallback sign function for testing/development only
-/// WARNING: This does NOT produce valid Ed25519 signatures
-fn sign_proof_message(message: &[u8]) -> RelayerSignature {
-    use sha2::{Sha256, Digest};
+/// Verify a relayer signature
+fn verify_relayer_signature(message: &[u8], sig: &RelayerSignature) -> Result<bool> {
+    use ed25519_dalek::{PublicKey, Signature, Verifier};
     
-    // Generate deterministic mock "signature" for testing
-    // WARNING: This is NOT a valid Ed25519 signature and should not be used in production
-    warn!("Using mock signature generation - NOT VALID FOR PRODUCTION");
-    
-    let mut sig_hasher = Sha256::new();
-    sig_hasher.update(b"MOCK_SIGNATURE:");
-    sig_hasher.update(message);
-    let hash = sig_hasher.finalize();
-    
-    // Pad to 64 bytes to match Ed25519 signature length
-    let mut signature = vec![0u8; 64];
-    signature[..32].copy_from_slice(&hash);
-    
-    // Mock relayer public key (32 bytes of zeros indicates mock signature)
-    let relayer_pubkey = vec![0u8; 32];
-    
-    RelayerSignature {
-        relayer_pubkey,
-        signature,
+    // Reject signatures with all-zero public key (legacy mock signatures)
+    if sig.relayer_pubkey.iter().all(|&b| b == 0) {
+        warn!("Rejecting signature with zero public key (mock signature detected)");
+        return Ok(false);
     }
+    
+    let public_key = PublicKey::from_bytes(&sig.relayer_pubkey)
+        .map_err(|e| anyhow::anyhow!("Invalid public key: {}", e))?;
+    
+    let signature = Signature::from_bytes(&sig.signature)
+        .map_err(|e| anyhow::anyhow!("Invalid signature format: {}", e))?;
+    
+    Ok(public_key.verify(message, &signature).is_ok())
 }
 
 /// Fetch and parse a deposit event from Solana transaction
