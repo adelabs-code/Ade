@@ -110,6 +110,10 @@ impl Validator {
     }
 
     /// Start validator
+    /// 
+    /// Uses TARGET-BASED timing to prevent clock drift.
+    /// Instead of sleeping for a fixed duration after work is done,
+    /// we calculate the target time for the next slot and sleep until then.
     pub async fn start(&self) -> Result<()> {
         info!("Starting validator with pubkey: {:?}", 
             bs58::encode(self.keypair.public.to_bytes()).into_string());
@@ -119,21 +123,67 @@ impl Validator {
             return Ok(());
         }
 
-        // Main validator loop
+        // Slot duration in milliseconds
+        const SLOT_DURATION_MS: u64 = 400;
+        
+        // Track the start time for accurate slot timing
+        let genesis_time = std::time::Instant::now();
+        let mut current_slot_offset: u64 = 0;
+
+        // Main validator loop with target-based timing
         loop {
             let slot = self.get_next_slot().await;
+            
+            // Calculate target time for THIS slot (not relative to work completion)
+            let target_slot_time = genesis_time + 
+                std::time::Duration::from_millis(current_slot_offset * SLOT_DURATION_MS);
             
             // Check if we are the leader
             if self.is_leader(slot).await {
                 info!("We are leader for slot {}", slot);
                 
+                let work_start = std::time::Instant::now();
+                
                 if let Err(e) = self.produce_and_process_block(slot).await {
                     warn!("Failed to produce block for slot {}: {}", slot, e);
                 }
+                
+                let work_duration = work_start.elapsed();
+                if work_duration.as_millis() > SLOT_DURATION_MS as u128 {
+                    warn!(
+                        "Block production took {}ms, exceeding slot duration ({}ms). \
+                        This may cause missed slots.",
+                        work_duration.as_millis(),
+                        SLOT_DURATION_MS
+                    );
+                }
             }
 
-            // Wait for next slot
-            tokio::time::sleep(tokio::time::Duration::from_millis(400)).await;
+            // Increment slot offset for next iteration
+            current_slot_offset += 1;
+            
+            // Calculate next slot target time
+            let next_slot_time = genesis_time + 
+                std::time::Duration::from_millis(current_slot_offset * SLOT_DURATION_MS);
+            
+            // Sleep until target time (not for a fixed duration)
+            // This prevents time drift regardless of how long block production takes
+            let now = std::time::Instant::now();
+            if next_slot_time > now {
+                let sleep_duration = next_slot_time - now;
+                tokio::time::sleep(sleep_duration).await;
+            } else {
+                // We're already past the target time - log warning but continue
+                let behind_ms = (now - next_slot_time).as_millis();
+                if behind_ms > SLOT_DURATION_MS as u128 {
+                    warn!(
+                        "Validator is {}ms behind schedule (> 1 slot). \
+                        Consider reducing block processing load.",
+                        behind_ms
+                    );
+                }
+                // Skip sleep entirely to catch up
+            }
         }
     }
 
