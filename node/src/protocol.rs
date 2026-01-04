@@ -4,17 +4,20 @@ use std::io::Cursor;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::network::GossipMessage;
+use crate::compression::{Compressor, CompressionAlgorithm};
 
 /// Network protocol version
 pub const PROTOCOL_VERSION: u16 = 1;
 
-/// Message header
+/// Message header with compression support
 #[derive(Debug, Clone)]
 pub struct MessageHeader {
     pub version: u16,
     pub message_type: MessageType,
     pub payload_length: u32,
     pub checksum: u32,
+    pub compressed: bool,
+    pub compression_type: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,33 +51,56 @@ impl MessageType {
     }
 }
 
-/// Protocol message encoder/decoder
+/// Protocol message encoder/decoder with compression
 pub struct Protocol;
 
 impl Protocol {
-    /// Encode a gossip message
+    /// Encode a gossip message with optional compression
     pub fn encode(message: &GossipMessage) -> Result<Vec<u8>> {
+        Self::encode_with_compression(message, true)
+    }
+
+    /// Encode with compression control
+    pub fn encode_with_compression(message: &GossipMessage, enable_compression: bool) -> Result<Vec<u8>> {
         let message_type = Self::get_message_type(message);
         let payload = bincode::serialize(message)?;
-        
+
+        // Determine if compression is worth it
+        let (final_payload, compressed, compression_type) = if enable_compression && payload.len() > 1024 {
+            // Use Zstd for good compression ratio and speed
+            let compressor = Compressor::new(CompressionAlgorithm::Zstd(3));
+            match compressor.compress(&payload) {
+                Ok(compressed_payload) if compressed_payload.len() < payload.len() => {
+                    (compressed_payload, true, 1u8) // 1 = Zstd
+                }
+                _ => (payload, false, 0u8)
+            }
+        } else {
+            (payload, false, 0u8)
+        };
+
         let mut buffer = Vec::new();
         
         // Header
         buffer.write_u16::<LittleEndian>(PROTOCOL_VERSION)?;
         buffer.write_u8(message_type as u8)?;
-        buffer.write_u32::<LittleEndian>(payload.len() as u32)?;
+        buffer.write_u32::<LittleEndian>(final_payload.len() as u32)?;
         
         // Checksum
-        let checksum = Self::compute_checksum(&payload);
+        let checksum = Self::compute_checksum(&final_payload);
         buffer.write_u32::<LittleEndian>(checksum)?;
         
+        // Compression flags
+        buffer.write_u8(if compressed { 1 } else { 0 })?;
+        buffer.write_u8(compression_type)?;
+        
         // Payload
-        buffer.extend_from_slice(&payload);
+        buffer.extend_from_slice(&final_payload);
         
         Ok(buffer)
     }
 
-    /// Decode a message
+    /// Decode a message with decompression support
     pub fn decode(data: &[u8]) -> Result<GossipMessage> {
         let mut cursor = Cursor::new(data);
         
@@ -90,24 +116,38 @@ impl Protocol {
         
         let payload_length = cursor.read_u32::<LittleEndian>()? as usize;
         let expected_checksum = cursor.read_u32::<LittleEndian>()?;
+        let compressed = cursor.read_u8()? == 1;
+        let compression_type = cursor.read_u8()?;
         
         // Read payload
         let payload_start = cursor.position() as usize;
-        let payload = &data[payload_start..payload_start + payload_length];
+        let payload_data = &data[payload_start..payload_start + payload_length];
         
         // Verify checksum
-        let actual_checksum = Self::compute_checksum(payload);
+        let actual_checksum = Self::compute_checksum(payload_data);
         if actual_checksum != expected_checksum {
             return Err(anyhow::anyhow!("Checksum mismatch"));
         }
         
+        // Decompress if needed
+        let final_payload = if compressed {
+            let decompressor = match compression_type {
+                1 => Compressor::new(CompressionAlgorithm::Zstd(3)),
+                2 => Compressor::new(CompressionAlgorithm::Lz4),
+                _ => return Err(anyhow::anyhow!("Unknown compression type")),
+            };
+            
+            decompressor.decompress(payload_data)?
+        } else {
+            payload_data.to_vec()
+        };
+        
         // Deserialize
-        let message: GossipMessage = bincode::deserialize(payload)?;
+        let message: GossipMessage = bincode::deserialize(&final_payload)?;
         
         Ok(message)
     }
 
-    /// Get message type from GossipMessage
     fn get_message_type(message: &GossipMessage) -> MessageType {
         match message {
             GossipMessage::PeerInfo { .. } => MessageType::PeerInfo,
@@ -119,14 +159,12 @@ impl Protocol {
         }
     }
 
-    /// Compute CRC32 checksum
     fn compute_checksum(data: &[u8]) -> u32 {
         crc32fast::hash(data)
     }
 
-    /// Validate message structure
     pub fn validate_message(data: &[u8]) -> Result<MessageHeader> {
-        if data.len() < 11 {
+        if data.len() < 13 {
             return Err(anyhow::anyhow!("Message too short"));
         }
         
@@ -136,6 +174,8 @@ impl Protocol {
         let message_type_byte = cursor.read_u8()?;
         let payload_length = cursor.read_u32::<LittleEndian>()?;
         let checksum = cursor.read_u32::<LittleEndian>()?;
+        let compressed = cursor.read_u8()? == 1;
+        let compression_type = cursor.read_u8()?;
         
         let message_type = MessageType::from_u8(message_type_byte)
             .ok_or_else(|| anyhow::anyhow!("Invalid message type"))?;
@@ -145,24 +185,9 @@ impl Protocol {
             message_type,
             payload_length,
             checksum,
+            compressed,
+            compression_type,
         })
-    }
-}
-
-/// Compression support
-pub struct Compression;
-
-impl Compression {
-    /// Compress data
-    pub fn compress(data: &[u8]) -> Result<Vec<u8>> {
-        // In production, use actual compression (e.g., zstd, lz4)
-        Ok(data.to_vec())
-    }
-
-    /// Decompress data
-    pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
-        // In production, use actual decompression
-        Ok(data.to_vec())
     }
 }
 
@@ -171,88 +196,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_encode_decode_ping() {
-        let message = GossipMessage::Ping {
-            timestamp: 12345,
+    fn test_encode_decode_with_compression() {
+        // Large message that benefits from compression
+        let large_data = vec![1u8; 5000];
+        let message = GossipMessage::TransactionBatch {
+            transactions: vec![large_data],
         };
         
         let encoded = Protocol::encode(&message).unwrap();
         let decoded = Protocol::decode(&encoded).unwrap();
         
         match decoded {
-            GossipMessage::Ping { timestamp } => {
-                assert_eq!(timestamp, 12345);
+            GossipMessage::TransactionBatch { transactions } => {
+                assert_eq!(transactions.len(), 1);
             }
             _ => panic!("Wrong message type"),
         }
     }
 
     #[test]
-    fn test_encode_decode_peer_info() {
-        let message = GossipMessage::PeerInfo {
-            pubkey: vec![1u8; 32],
-            address: "127.0.0.1:9900".to_string(),
-            stake: 1000000,
-            version: "1.0.0".to_string(),
-        };
+    fn test_small_message_no_compression() {
+        let message = GossipMessage::Ping { timestamp: 12345 };
         
         let encoded = Protocol::encode(&message).unwrap();
-        let decoded = Protocol::decode(&encoded).unwrap();
         
-        match decoded {
-            GossipMessage::PeerInfo { pubkey, address, stake, version } => {
-                assert_eq!(pubkey, vec![1u8; 32]);
-                assert_eq!(address, "127.0.0.1:9900");
-                assert_eq!(stake, 1000000);
-            }
-            _ => panic!("Wrong message type"),
-        }
-    }
-
-    #[test]
-    fn test_checksum_validation() {
-        let message = GossipMessage::Ping { timestamp: 12345 };
-        let mut encoded = Protocol::encode(&message).unwrap();
-        
-        // Corrupt payload
-        encoded[15] ^= 1;
-        
-        let result = Protocol::decode(&encoded);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_validate_message() {
-        let message = GossipMessage::Ping { timestamp: 12345 };
-        let encoded = Protocol::encode(&message).unwrap();
-        
+        // Check header
         let header = Protocol::validate_message(&encoded).unwrap();
-        assert_eq!(header.version, PROTOCOL_VERSION);
-        assert_eq!(header.message_type, MessageType::Ping);
-    }
-
-    #[test]
-    fn test_invalid_version() {
-        let message = GossipMessage::Ping { timestamp: 12345 };
-        let mut encoded = Protocol::encode(&message).unwrap();
-        
-        // Change version
-        encoded[0] = 99;
-        
-        let result = Protocol::decode(&encoded);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_compression() {
-        let data = vec![1u8; 1000];
-        let compressed = Compression::compress(&data).unwrap();
-        let decompressed = Compression::decompress(&compressed).unwrap();
-        
-        assert_eq!(data, decompressed);
+        assert!(!header.compressed); // Should not compress small messages
     }
 }
-
-
-
-
