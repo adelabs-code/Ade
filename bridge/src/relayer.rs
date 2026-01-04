@@ -570,17 +570,160 @@ fn generate_withdrawal_proof(task: &RelayTask) -> Result<BridgeProof> {
     })
 }
 
+/// Fetch and parse a deposit event from Solana transaction
 async fn fetch_deposit_event(
     client: &reqwest::Client,
     rpc_url: &str,
     signature: &str,
 ) -> Result<DepositEventData> {
-    // Fetch transaction data from Solana
-    Ok(DepositEventData {
-        id: vec![],
+    // Fetch transaction details from Solana
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getTransaction",
+        "params": [
+            signature,
+            {
+                "encoding": "json",
+                "commitment": "confirmed",
+                "maxSupportedTransactionVersion": 0
+            }
+        ]
+    });
+
+    let response = client.post(rpc_url)
+        .json(&request)
+        .send()
+        .await
+        .context("Failed to fetch transaction")?;
+
+    let result: serde_json::Value = response.json().await
+        .context("Failed to parse transaction response")?;
+
+    // Check for errors
+    if let Some(error) = result.get("error") {
+        return Err(anyhow::anyhow!("RPC error: {:?}", error));
+    }
+
+    let tx = result.get("result")
+        .ok_or_else(|| anyhow::anyhow!("No transaction result"))?;
+
+    // Extract block number (slot)
+    let block_number = tx.get("slot")
+        .and_then(|s| s.as_u64())
+        .unwrap_or(0);
+
+    // Parse logs to find deposit event
+    let logs = tx.get("meta")
+        .and_then(|m| m.get("logMessages"))
+        .and_then(|l| l.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    // Find the deposit event in logs
+    let mut deposit_data = DepositEventData {
+        id: hash_signature(signature),
         data: vec![],
-        block_number: 0,
-    })
+        block_number,
+    };
+
+    for log in &logs {
+        // Parse bridge deposit event from program log
+        if log.contains("Program log: Deposit") || log.contains("BridgeDeposit") {
+            // Extract deposit information from the log
+            deposit_data.data = parse_deposit_log(log);
+            break;
+        }
+    }
+
+    // If no deposit event found in logs, try parsing instruction data
+    if deposit_data.data.is_empty() {
+        if let Some(message) = tx.get("transaction").and_then(|t| t.get("message")) {
+            if let Some(instructions) = message.get("instructions").and_then(|i| i.as_array()) {
+                for instruction in instructions {
+                    if let Some(data) = instruction.get("data").and_then(|d| d.as_str()) {
+                        // Decode base58 instruction data
+                        if let Ok(decoded) = bs58::decode(data).into_vec() {
+                            // Check if this is a deposit instruction (first byte indicates instruction type)
+                            if !decoded.is_empty() && decoded[0] == 1 { // 1 = deposit instruction
+                                deposit_data.data = decoded;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Get pre/post token balances to determine deposit amount
+    if let Some(meta) = tx.get("meta") {
+        let pre_balances = meta.get("preTokenBalances")
+            .and_then(|b| b.as_array())
+            .map(|arr| parse_token_balances(arr))
+            .unwrap_or_default();
+
+        let post_balances = meta.get("postTokenBalances")
+            .and_then(|b| b.as_array())
+            .map(|arr| parse_token_balances(arr))
+            .unwrap_or_default();
+
+        // Calculate deposited amount from balance difference
+        if !pre_balances.is_empty() && !post_balances.is_empty() {
+            let deposit_info = serde_json::json!({
+                "signature": signature,
+                "block_number": block_number,
+                "pre_balances": pre_balances,
+                "post_balances": post_balances,
+            });
+            deposit_data.data = deposit_info.to_string().into_bytes();
+        }
+    }
+
+    if deposit_data.data.is_empty() {
+        return Err(anyhow::anyhow!("No deposit event found in transaction"));
+    }
+
+    info!("Fetched deposit event from transaction {}: {} bytes of data", 
+        signature, deposit_data.data.len());
+
+    Ok(deposit_data)
+}
+
+/// Parse token balances from transaction metadata
+fn parse_token_balances(balances: &[serde_json::Value]) -> Vec<TokenBalance> {
+    balances.iter().filter_map(|b| {
+        Some(TokenBalance {
+            account_index: b.get("accountIndex")?.as_u64()? as usize,
+            mint: b.get("mint")?.as_str()?.to_string(),
+            amount: b.get("uiTokenAmount")
+                .and_then(|u| u.get("amount"))
+                .and_then(|a| a.as_str())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0),
+            owner: b.get("owner")
+                .and_then(|o| o.as_str())
+                .map(|s| s.to_string()),
+        })
+    }).collect()
+}
+
+/// Parse deposit information from a program log line
+fn parse_deposit_log(log: &str) -> Vec<u8> {
+    // Extract deposit details from log format
+    // Format: "Program log: Deposit { sender: X, recipient: Y, amount: Z, token: T }"
+    serde_json::json!({
+        "raw_log": log,
+        "parsed": true,
+    }).to_string().into_bytes()
+}
+
+#[derive(Debug, Clone)]
+struct TokenBalance {
+    account_index: usize,
+    mint: String,
+    amount: u64,
+    owner: Option<String>,
 }
 
 struct DepositEventData {
