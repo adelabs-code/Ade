@@ -42,6 +42,15 @@ struct CacheStats {
     misses: u64,
 }
 
+/// Storage statistics for monitoring
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageStats {
+    pub total_used_bytes: u64,
+    pub max_allowed_bytes: u64,
+    pub model_count: usize,
+    pub max_model_size_bytes: usize,
+}
+
 /// RAII guard for tracking active executions
 /// Ensures the counter is decremented when dropped
 struct ExecutionGuard {
@@ -185,21 +194,148 @@ impl AIRuntime {
         })
     }
 
+    /// Maximum allowed model size (100 MB)
+    /// This prevents disk exhaustion attacks from malicious uploads
+    pub const MAX_MODEL_SIZE_BYTES: usize = 100 * 1024 * 1024;
+    
+    /// Maximum total storage for all models (10 GB)
+    pub const MAX_TOTAL_STORAGE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+    
     /// Store a model by its bytes and return the hash
+    /// 
+    /// SECURITY: Enforces size limits to prevent disk exhaustion attacks.
+    /// - Individual model limit: 100 MB
+    /// - Total storage limit: 10 GB
     pub fn store_model(&self, model_bytes: &[u8]) -> Result<Vec<u8>> {
-        let model_hash = hash_data(model_bytes);
-        let hash_str = to_base58(&model_hash);
+        // SECURITY CHECK 1: Reject oversized models immediately
+        if model_bytes.len() > Self::MAX_MODEL_SIZE_BYTES {
+            error!(
+                "Model upload rejected: {} bytes exceeds limit of {} bytes ({} MB)",
+                model_bytes.len(),
+                Self::MAX_MODEL_SIZE_BYTES,
+                Self::MAX_MODEL_SIZE_BYTES / (1024 * 1024)
+            );
+            return Err(anyhow::anyhow!(
+                "Model too large: {} MB exceeds maximum allowed size of {} MB",
+                model_bytes.len() / (1024 * 1024),
+                Self::MAX_MODEL_SIZE_BYTES / (1024 * 1024)
+            ));
+        }
         
         // Create model storage directory if it doesn't exist
         std::fs::create_dir_all(&self.model_storage_path)
             .context("Failed to create model storage directory")?;
         
+        // SECURITY CHECK 2: Check total storage before writing
+        let current_storage = self.get_total_storage_used()?;
+        if current_storage + model_bytes.len() as u64 > Self::MAX_TOTAL_STORAGE_BYTES {
+            error!(
+                "Storage quota exceeded: current {} bytes + {} bytes would exceed {} bytes limit",
+                current_storage,
+                model_bytes.len(),
+                Self::MAX_TOTAL_STORAGE_BYTES
+            );
+            return Err(anyhow::anyhow!(
+                "Storage quota exceeded: current usage {} GB + new model {} MB would exceed {} GB limit. \
+                Delete unused models to free space.",
+                current_storage / (1024 * 1024 * 1024),
+                model_bytes.len() / (1024 * 1024),
+                Self::MAX_TOTAL_STORAGE_BYTES / (1024 * 1024 * 1024)
+            ));
+        }
+        
+        let model_hash = hash_data(model_bytes);
+        let hash_str = to_base58(&model_hash);
+        
+        // Check if model already exists (deduplication)
         let bytes_path = format!("{}/{}.bin", self.model_storage_path, hash_str);
+        if std::path::Path::new(&bytes_path).exists() {
+            info!("Model already exists with hash: {} (skipping duplicate)", hash_str);
+            return Ok(model_hash);
+        }
+        
         std::fs::write(&bytes_path, model_bytes)
             .context("Failed to store model bytes")?;
         
-        info!("Stored model with hash: {}", hash_str);
+        info!(
+            "Stored model with hash: {} ({} bytes, total storage: {} MB)",
+            hash_str,
+            model_bytes.len(),
+            (current_storage + model_bytes.len() as u64) / (1024 * 1024)
+        );
+        
         Ok(model_hash)
+    }
+    
+    /// Get total storage used by all models
+    fn get_total_storage_used(&self) -> Result<u64> {
+        let mut total: u64 = 0;
+        
+        if !std::path::Path::new(&self.model_storage_path).exists() {
+            return Ok(0);
+        }
+        
+        for entry in std::fs::read_dir(&self.model_storage_path)
+            .context("Failed to read model storage directory")?
+        {
+            if let Ok(entry) = entry {
+                if let Ok(metadata) = entry.metadata() {
+                    total += metadata.len();
+                }
+            }
+        }
+        
+        Ok(total)
+    }
+    
+    /// Delete a model by hash (for cleanup)
+    pub fn delete_model(&self, model_hash: &[u8]) -> Result<()> {
+        let hash_str = to_base58(model_hash);
+        
+        let onnx_path = format!("{}/{}.onnx", self.model_storage_path, hash_str);
+        let bin_path = format!("{}/{}.bin", self.model_storage_path, hash_str);
+        
+        let mut deleted = false;
+        
+        if std::path::Path::new(&onnx_path).exists() {
+            std::fs::remove_file(&onnx_path)
+                .context("Failed to delete ONNX model")?;
+            deleted = true;
+        }
+        
+        if std::path::Path::new(&bin_path).exists() {
+            std::fs::remove_file(&bin_path)
+                .context("Failed to delete binary model")?;
+            deleted = true;
+        }
+        
+        if deleted {
+            info!("Deleted model with hash: {}", hash_str);
+            // Evict from cache
+            self.model_cache.evict(&hash_str);
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Model not found: {}", hash_str))
+        }
+    }
+    
+    /// Get storage statistics
+    pub fn get_storage_stats(&self) -> Result<StorageStats> {
+        let total_used = self.get_total_storage_used()?;
+        let model_count = if std::path::Path::new(&self.model_storage_path).exists() {
+            std::fs::read_dir(&self.model_storage_path)
+                .map(|entries| entries.count())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        
+        Ok(StorageStats {
+            total_used_bytes: total_used,
+            max_allowed_bytes: Self::MAX_TOTAL_STORAGE_BYTES,
+            model_count,
+            max_model_size_bytes: Self::MAX_MODEL_SIZE_BYTES,
+        })
     }
 
     pub fn deploy_agent(
