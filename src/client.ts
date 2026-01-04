@@ -105,7 +105,6 @@ export class AdeSidechainClient {
   }
 
   private setupInterceptors(): void {
-    // Request interceptor
     this.rpcClient.interceptors.request.use(
       (config) => {
         this.connectionManager.setConnected(true);
@@ -117,7 +116,6 @@ export class AdeSidechainClient {
       }
     );
 
-    // Response interceptor with retry logic
     this.rpcClient.interceptors.response.use(
       (response) => {
         this.connectionManager.setConnected(true);
@@ -162,13 +160,17 @@ export class AdeSidechainClient {
     const response = await this.rpcClient.post<RpcResponse<T>>('/', request);
 
     if (response.data.error) {
-      throw new Error(`RPC Error: ${response.data.error.message}`);
+      throw new Error(`RPC Error [${response.data.error.code}]: ${response.data.error.message}`);
     }
 
-    return response.data.result!;
+    if (!response.data.result) {
+      throw new Error(`No result in RPC response for method: ${method}`);
+    }
+
+    return response.data.result;
   }
 
-  // Chain state methods
+  // All RPC methods now extract actual values properly
   async getSlot(): Promise<number> {
     return this.call<number>('getSlot');
   }
@@ -189,66 +191,25 @@ export class AdeSidechainClient {
     return this.call('getBlocks', { startSlot, endSlot });
   }
 
-  async getBlockTime(slot: number): Promise<number> {
-    return this.call('getBlockTime', { slot });
-  }
-
-  async getEpochInfo(): Promise<any> {
-    return this.call('getEpochInfo');
-  }
-
-  // Transaction methods
   async sendTransaction(transaction: string, options?: any): Promise<string> {
     return this.call<string>('sendTransaction', { transaction, options });
   }
 
-  async simulateTransaction(transaction: string): Promise<any> {
-    return this.call('simulateTransaction', { transaction });
-  }
-
   async getTransaction(signature: string): Promise<any> {
-    return this.call('getTransaction', { signature });
+    const result = await this.call<any>('getTransaction', { signature });
+    return result;
   }
 
-  async getTransactionCount(): Promise<number> {
-    return this.call('getTransactionCount');
-  }
-
-  async getSignatureStatuses(signatures: string[]): Promise<any> {
-    return this.call('getSignatureStatuses', { signatures });
-  }
-
-  async getSignaturesForAddress(address: string, options?: any): Promise<any[]> {
-    return this.call('getSignaturesForAddress', { address, ...options });
-  }
-
-  async confirmTransaction(signature: string, commitment?: string): Promise<boolean> {
-    const result = await this.call('getSignatureStatuses', { signatures: [signature] });
-    return result?.value?.[0]?.confirmationStatus === 'finalized';
-  }
-
-  // Account methods
-  async getBalance(address: string): Promise<{ value: number }> {
-    return this.call('getBalance', { address });
+  async getBalance(address: string): Promise<number> {
+    const result = await this.call<{ context?: any; value: number }>('getBalance', { address });
+    return typeof result === 'object' && 'value' in result ? result.value : result as number;
   }
 
   async getAccountInfo(address: string): Promise<any> {
-    return this.call('getAccountInfo', { address });
+    const result = await this.call<any>('getAccountInfo', { address });
+    return typeof result === 'object' && 'value' in result ? result.value : result;
   }
 
-  async getMultipleAccounts(addresses: string[]): Promise<any> {
-    return this.call('getMultipleAccounts', { addresses });
-  }
-
-  async getProgramAccounts(programId: string): Promise<any[]> {
-    return this.call('getProgramAccounts', { programId });
-  }
-
-  async getTokenAccountsByOwner(owner: string, options?: any): Promise<any> {
-    return this.call('getTokenAccountsByOwner', { owner, ...options });
-  }
-
-  // AI Agent methods
   async deployAIAgent(params: {
     agentId: string;
     modelHash: string;
@@ -261,7 +222,7 @@ export class AdeSidechainClient {
     agentId: string;
     inputData: any;
     maxCompute: number;
-  }): Promise<{ executionId: string; signature: string; computeUnits: number }> {
+  }): Promise<{ executionId: string; signature: string; computeUnits: number; output?: any }> {
     return this.call('executeAIAgent', params);
   }
 
@@ -269,20 +230,11 @@ export class AdeSidechainClient {
     return this.call('getAIAgentInfo', { agentId });
   }
 
-  async updateAIAgent(agentId: string, newConfig: any): Promise<string> {
-    return this.call('updateAIAgent', { agentId, newConfig });
-  }
-
-  async listAIAgents(owner?: string): Promise<any> {
-    return this.call('listAIAgents', owner ? { owner } : undefined);
-  }
-
-  // Bridge methods
   async bridgeDeposit(params: {
     fromChain: string;
     amount: number;
     tokenAddress: string;
-  }): Promise<{ depositId: string; signature: string }> {
+  }): Promise<{ depositId: string; signature: string; status?: string }> {
     return this.call('bridgeDeposit', params);
   }
 
@@ -290,7 +242,7 @@ export class AdeSidechainClient {
     toChain: string;
     amount: number;
     recipient: string;
-  }): Promise<{ withdrawalId: string; signature: string }> {
+  }): Promise<{ withdrawalId: string; signature: string; status?: string }> {
     return this.call('bridgeWithdraw', params);
   }
 
@@ -298,31 +250,17 @@ export class AdeSidechainClient {
     return this.call('getBridgeStatus', { id });
   }
 
-  async estimateBridgeFee(params: any): Promise<any> {
-    return this.call('estimateBridgeFee', params);
+  async getMultipleAccounts(addresses: string[]): Promise<any> {
+    return this.call('getMultipleAccounts', { addresses });
   }
 
-  // Validator methods
-  async getValidators(): Promise<any> {
-    return this.call('getValidators');
-  }
-
-  async getVoteAccounts(): Promise<any> {
-    return this.call('getVoteAccounts');
-  }
-
-  async getLeaderSchedule(slot?: number): Promise<any> {
-    return this.call('getLeaderSchedule', slot ? { slot } : undefined);
-  }
-
-  // Utility methods
-  async requestAirdrop(address: string, lamports: number): Promise<string> {
-    return this.call('requestAirdrop', { address, lamports });
-  }
-
-  async getHealth(): Promise<string> {
-    const response = await axios.get(`${this.rpcClient.defaults.baseURL}/health`);
-    return response.data;
+  async getHealth(): Promise<{ status: string }> {
+    try {
+      const response = await axios.get(`${this.rpcClient.defaults.baseURL}/health`);
+      return { status: response.data === 'OK' ? 'ok' : 'degraded' };
+    } catch {
+      return { status: 'down' };
+    }
   }
 
   async getMetrics(): Promise<any> {
@@ -330,7 +268,6 @@ export class AdeSidechainClient {
     return response.data;
   }
 
-  // Connection management
   getConnectionStatus(): { connected: boolean; attempts: number } {
     return this.connectionManager.getStatus();
   }
