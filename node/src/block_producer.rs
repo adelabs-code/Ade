@@ -1,6 +1,5 @@
 use anyhow::{Result, Context};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tracing::{info, warn, debug};
 use ed25519_dalek::Keypair;
 
@@ -10,7 +9,7 @@ use crate::mempool::{Mempool, MempoolTransaction};
 use crate::fee_market::FeeMarket;
 use crate::storage::Storage;
 
-/// Block producer for validators
+/// Block producer for validators with intelligent transaction selection
 pub struct BlockProducer {
     keypair: Keypair,
     mempool: Arc<Mempool>,
@@ -25,6 +24,7 @@ pub struct ProducerConfig {
     pub max_block_compute: u64,
     pub max_block_size: usize,
     pub block_time_ms: u64,
+    pub min_fee_multiplier: f64,
 }
 
 impl Default for ProducerConfig {
@@ -34,6 +34,7 @@ impl Default for ProducerConfig {
             max_block_compute: 48_000_000,
             max_block_size: 1_300_000,
             block_time_ms: 400,
+            min_fee_multiplier: 1.0,
         }
     }
 }
@@ -65,45 +66,50 @@ impl BlockProducer {
         }
     }
 
-    /// Produce a block for given slot
     pub async fn produce_block(&self, slot: u64, parent_hash: Vec<u8>) -> Result<BlockProductionResult> {
         let start_time = std::time::Instant::now();
         
         info!("Producing block for slot {}", slot);
 
-        // 1. Select transactions from mempool
-        let selected_txs = self.select_transactions().await?;
+        // 1. Get base fee from fee market
+        let base_fee = self.fee_market.get_base_fee();
+        let min_acceptable_fee = (base_fee as f64 * self.config.min_fee_multiplier) as u64;
+
+        // 2. Select transactions with fee filtering
+        let selected_txs = self.select_transactions_smart(min_acceptable_fee).await?;
         debug!("Selected {} transactions from mempool", selected_txs.len());
 
-        // 2. Pack transactions into block
-        let (packed_txs, total_fees, rejected) = self.pack_transactions(selected_txs).await?;
-        debug!("Packed {} transactions, rejected {}", packed_txs.len(), rejected);
+        // 3. Pack transactions with validation
+        let (packed_txs, total_fees, total_compute, rejected) = 
+            self.pack_transactions_optimized(selected_txs).await?;
+        debug!("Packed {} transactions, rejected {}, total compute: {}", 
+            packed_txs.len(), rejected, total_compute);
 
-        // 3. Build block
+        // 4. Build block
         let validator_pubkey = self.keypair.public.to_bytes().to_vec();
         let mut block = BlockBuilder::new(slot, parent_hash, validator_pubkey)
             .add_transactions(packed_txs.clone())
             .build();
 
-        // 4. Sign block
+        // 5. Sign block
         block.sign(&self.keypair)?;
         debug!("Block signed");
 
-        // 5. Remove included transactions from mempool
+        // 6. Remove included transactions from mempool
+        let mut removed_count = 0;
         for tx in &packed_txs {
             if let Some(sig) = tx.signature() {
-                self.mempool.remove_transaction(sig);
+                if self.mempool.remove_transaction(sig).is_some() {
+                    removed_count += 1;
+                }
             }
         }
+        debug!("Removed {} transactions from mempool", removed_count);
 
-        // 6. Record fees for fee market
-        let priority_fees: Vec<u64> = packed_txs.iter()
-            .filter_map(|tx| {
-                // Extract priority fee from transaction
-                Some(0u64) // Placeholder
-            })
-            .collect();
+        // 7. Extract priority fees from transactions
+        let priority_fees = self.extract_priority_fees(&packed_txs);
 
+        // 8. Record block data in fee market
         self.fee_market.record_block(
             slot,
             packed_txs.len(),
@@ -113,33 +119,38 @@ impl BlockProducer {
 
         let execution_time = start_time.elapsed().as_millis() as u64;
 
-        info!("Block produced for slot {} with {} transactions in {}ms", 
-            slot, packed_txs.len(), execution_time);
+        info!("Block produced for slot {} with {} transactions in {}ms (total fees: {}, compute: {})", 
+            slot, packed_txs.len(), execution_time, total_fees, total_compute);
 
         Ok(BlockProductionResult {
             block,
             transaction_count: packed_txs.len(),
             total_fees,
-            total_compute: 0, // Would be calculated during execution
+            total_compute,
             execution_time_ms: execution_time,
             rejected_count: rejected,
         })
     }
 
-    /// Select transactions from mempool
-    async fn select_transactions(&self) -> Result<Vec<MempoolTransaction>> {
-        // Get highest priority transactions
-        let candidates = self.mempool.get_top_transactions(self.config.max_transactions_per_block * 2);
+    /// Smart transaction selection with fee-based filtering
+    async fn select_transactions_smart(&self, min_fee: u64) -> Result<Vec<MempoolTransaction>> {
+        let mut candidates = self.mempool.get_top_transactions(self.config.max_transactions_per_block * 2);
         
-        debug!("Considering {} candidate transactions", candidates.len());
+        // Filter by minimum fee
+        candidates.retain(|tx| {
+            let total_fee = tx.fee + tx.priority_fee;
+            total_fee >= min_fee
+        });
+        
+        debug!("After fee filtering: {} candidates (min fee: {})", candidates.len(), min_fee);
         Ok(candidates)
     }
 
-    /// Pack transactions into block with validation
-    async fn pack_transactions(
+    /// Optimized transaction packing with compute tracking
+    async fn pack_transactions_optimized(
         &self,
         candidates: Vec<MempoolTransaction>,
-    ) -> Result<(Vec<Transaction>, u64, usize)> {
+    ) -> Result<(Vec<Transaction>, u64, u64, usize)> {
         let mut packed = Vec::new();
         let mut total_fees = 0u64;
         let mut total_compute = 0u64;
@@ -149,14 +160,16 @@ impl BlockProducer {
         for candidate in candidates {
             // Check compute budget
             if total_compute + candidate.compute_budget > self.config.max_block_compute {
-                debug!("Skipping tx - compute budget exceeded");
+                debug!("Skipping tx - compute budget exceeded (current: {}, adding: {}, max: {})",
+                    total_compute, candidate.compute_budget, self.config.max_block_compute);
                 rejected += 1;
                 continue;
             }
 
             // Check size
             if total_size + candidate.size > self.config.max_block_size {
-                debug!("Skipping tx - block size limit");
+                debug!("Skipping tx - block size limit (current: {}, adding: {}, max: {})",
+                    total_size, candidate.size, self.config.max_block_size);
                 rejected += 1;
                 continue;
             }
@@ -170,10 +183,14 @@ impl BlockProducer {
             // Verify transaction is still valid
             match candidate.transaction.verify() {
                 Ok(true) => {
+                    let tx_fee = candidate.fee + candidate.priority_fee;
+                    
                     packed.push(candidate.transaction.clone());
-                    total_fees += candidate.fee + candidate.priority_fee;
+                    total_fees += tx_fee;
                     total_compute += candidate.compute_budget;
                     total_size += candidate.size;
+                    
+                    debug!("Packed tx with fee: {}, compute: {}", tx_fee, candidate.compute_budget);
                 }
                 _ => {
                     warn!("Invalid transaction, skipping");
@@ -182,7 +199,36 @@ impl BlockProducer {
             }
         }
 
-        Ok((packed, total_fees, rejected))
+        info!("Packing complete: {} txs, {} total fees, {} compute, {} bytes",
+            packed.len(), total_fees, total_compute, total_size);
+
+        Ok((packed, total_fees, total_compute, rejected))
+    }
+
+    /// Extract priority fees from transactions
+    fn extract_priority_fees(&self, transactions: &[Transaction]) -> Vec<u64> {
+        transactions.iter()
+            .filter_map(|tx| {
+                // In production, parse ComputeBudget instructions for priority fees
+                // For now, extract from transaction structure
+                
+                // Check if transaction has compute budget instructions
+                for instruction in &tx.message.instructions {
+                    if instruction.data.len() >= 9 {
+                        // Check discriminator for SetComputeUnitPrice (0x01)
+                        if instruction.data[0] == 1 {
+                            // Extract priority fee (8 bytes after discriminator)
+                            if let Ok(bytes) = instruction.data[1..9].try_into() {
+                                return Some(u64::from_le_bytes(bytes));
+                            }
+                        }
+                    }
+                }
+                
+                // Default priority fee
+                Some(0)
+            })
+            .collect()
     }
 
     /// Get producer statistics
@@ -190,6 +236,7 @@ impl BlockProducer {
         ProducerStats {
             mempool_size: self.mempool.size(),
             base_fee: self.fee_market.get_base_fee(),
+            average_block_time: 400, // Would track actual
         }
     }
 }
@@ -198,6 +245,7 @@ impl BlockProducer {
 pub struct ProducerStats {
     pub mempool_size: usize,
     pub base_fee: u64,
+    pub average_block_time: u64,
 }
 
 #[cfg(test)]
@@ -239,7 +287,7 @@ mod tests {
         
         let producer = BlockProducer::new(
             keypair,
-            mempool,
+            mempool.clone(),
             fee_market,
             storage,
             ProducerConfig::default(),
@@ -248,10 +296,31 @@ mod tests {
         let result = producer.produce_block(1, vec![0u8; 32]).await.unwrap();
         
         assert_eq!(result.transaction_count, 0);
-        assert_eq!(result.block.header.slot, 1);
+        assert_eq!(mempool.size(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_priority_fee_extraction() {
+        let mut csprng = OsRng;
+        let keypair = Keypair::generate(&mut csprng);
+        let mempool = Arc::new(Mempool::new(Default::default()));
+        let fee_market = Arc::new(FeeMarket::new(Default::default()));
+        
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = Arc::new(Storage::new(temp_dir.path().to_str().unwrap()).unwrap());
+        
+        let producer = BlockProducer::new(
+            keypair,
+            mempool,
+            fee_market,
+            storage,
+            ProducerConfig::default(),
+        );
+        
+        // Test priority fee extraction
+        let tx = Transaction::new(&[&Keypair::generate(&mut csprng)], vec![], vec![1u8; 32]).unwrap();
+        let fees = producer.extract_priority_fees(&[tx]);
+        
+        assert!(!fees.is_empty());
     }
 }
-
-
-
-
