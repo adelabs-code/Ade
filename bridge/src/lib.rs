@@ -5,6 +5,7 @@ pub mod merkle;
 pub mod multisig;
 pub mod proof_verification;
 pub mod event_parser;
+pub mod bridge_coordinator;
 
 // Re-export Solana program types
 pub mod solana_lock {
@@ -29,3 +30,4 @@ pub use merkle::{MerkleTree, MerkleProof, SparseMerkleTree};
 pub use multisig::{MultiSigRelayer, RelayerSignature, MultiSigError, RelayerSetManager};
 pub use proof_verification::{ProofVerifier, ProofBuilder, VerificationResult};
 pub use event_parser::{EventParser, EventEmitter, ParsedDepositEvent, ParsedWithdrawalEvent, EmittedEvent, EventType};
+pub use bridge_coordinator::{BridgeCoordinator, CoordinatorStats};
