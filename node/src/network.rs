@@ -560,14 +560,62 @@ impl NetworkManager {
             send_count, mesh_size, peer_count
         );
         
-        // In production, this would actually send the message to each peer
-        // For now, we just simulate the send
-        for _peer in &target_peers {
-            // TODO: Actually send message to peer via TCP/UDP
-            // await self.send_to_peer(&peer.address, &message)?;
+        // Serialize message once for all sends
+        let message_bytes = bincode::serialize(&message)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize message: {}", e))?;
+        
+        // Send to each target peer
+        let mut success_count = 0;
+        for peer in &target_peers {
+            match self.send_message_to_peer(&peer.address, &message_bytes).await {
+                Ok(_) => {
+                    success_count += 1;
+                }
+                Err(e) => {
+                    debug!("Failed to send to peer {}: {}", peer.address, e);
+                    // Don't fail the broadcast if some peers are unreachable
+                }
+            }
+        }
+        
+        if success_count < send_count {
+            debug!(
+                "Broadcast partially successful: {}/{} peers reached",
+                success_count, send_count
+            );
         }
 
-        Ok(send_count)
+        Ok(success_count)
+    }
+    
+    /// Send a serialized message to a specific peer via TCP
+    async fn send_message_to_peer(&self, address: &str, message_bytes: &[u8]) -> Result<()> {
+        use tokio::net::TcpStream;
+        use tokio::io::AsyncWriteExt;
+        
+        // Parse address (format: "host:port")
+        let mut stream = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            TcpStream::connect(address)
+        ).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => return Err(anyhow::anyhow!("Connection failed: {}", e)),
+            Err(_) => return Err(anyhow::anyhow!("Connection timeout")),
+        };
+        
+        // Send message length (4 bytes, big endian)
+        let len = message_bytes.len() as u32;
+        stream.write_all(&len.to_be_bytes()).await
+            .map_err(|e| anyhow::anyhow!("Failed to send length: {}", e))?;
+        
+        // Send message body
+        stream.write_all(message_bytes).await
+            .map_err(|e| anyhow::anyhow!("Failed to send message: {}", e))?;
+        
+        stream.flush().await
+            .map_err(|e| anyhow::anyhow!("Failed to flush: {}", e))?;
+        
+        Ok(())
     }
     
     /// Get or build the mesh peers for this node
