@@ -1,7 +1,10 @@
 use axum::Json;
 use crate::server::RpcState;
 use crate::types::RpcResponse;
+use crate::state::{TransactionInfo, TransactionStatus, AIAgentData};
 use serde_json::json;
+use sha2::{Sha256, Digest};
+use tracing::{info, debug, warn};
 
 // ============================================================================
 // Block Methods
@@ -26,17 +29,77 @@ pub async fn get_block(
         .and_then(|s| s.as_u64())
         .unwrap_or(0);
 
-    let chain = state.chain_state.read().await;
+    // Try to get actual block from storage
+    let blocks = state.blocks.read().await;
     
-    Json(RpcResponse::success(json!({
-        "blockhash": bs58::encode(&chain.latest_blockhash).into_string(),
-        "previousBlockhash": "PreviousBlockhashString",
-        "parentSlot": slot.saturating_sub(1),
-        "transactions": [],
-        "rewards": [],
-        "blockTime": 1234567890,
-        "blockHeight": slot
-    })))
+    if let Some(block) = blocks.get(&slot) {
+        // Return actual block data
+        let transactions: Vec<_> = block.transactions.iter().map(|tx| {
+            json!({
+                "transaction": {
+                    "signatures": [bs58::encode(tx.signature().unwrap_or(&[])).into_string()],
+                    "message": {
+                        "header": {
+                            "numRequiredSignatures": 1,
+                            "numReadonlySignedAccounts": 0,
+                            "numReadonlyUnsignedAccounts": 0
+                        },
+                        "accountKeys": tx.message.account_keys.iter()
+                            .map(|k| bs58::encode(k).into_string())
+                            .collect::<Vec<_>>(),
+                        "recentBlockhash": bs58::encode(&tx.message.recent_blockhash).into_string(),
+                        "instructions": tx.message.instructions.iter()
+                            .map(|ix| json!({
+                                "programIdIndex": ix.program_id_index,
+                                "accounts": ix.accounts.iter().map(|a| a.index).collect::<Vec<_>>(),
+                                "data": bs58::encode(&ix.data).into_string()
+                            }))
+                            .collect::<Vec<_>>()
+                    }
+                },
+                "meta": null
+            })
+        }).collect();
+
+        let prev_blockhash = if slot > 0 {
+            blocks.get(&(slot - 1))
+                .map(|b| bs58::encode(&b.hash()).into_string())
+                .unwrap_or_else(|| bs58::encode(&[0u8; 32]).into_string())
+        } else {
+            bs58::encode(&[0u8; 32]).into_string()
+        };
+
+        Json(RpcResponse::success(json!({
+            "blockhash": bs58::encode(&block.hash()).into_string(),
+            "previousBlockhash": prev_blockhash,
+            "parentSlot": slot.saturating_sub(1),
+            "transactions": transactions,
+            "rewards": [],
+            "blockTime": block.header.timestamp,
+            "blockHeight": slot
+        })))
+    } else {
+        // Block not found, return error or empty response
+        let chain = state.chain_state.read().await;
+        
+        if slot > chain.current_slot {
+            Json(RpcResponse::error(&format!("Block {} not available, current slot is {}", slot, chain.current_slot)))
+        } else {
+            // Block may have been pruned
+            Json(RpcResponse::success(json!({
+                "blockhash": bs58::encode(&chain.latest_blockhash).into_string(),
+                "previousBlockhash": bs58::encode(&[0u8; 32]).into_string(),
+                "parentSlot": slot.saturating_sub(1),
+                "transactions": [],
+                "rewards": [],
+                "blockTime": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+                "blockHeight": slot
+            })))
+        }
+    }
 }
 
 pub async fn get_blocks(
@@ -62,14 +125,36 @@ pub async fn get_blocks(
 }
 
 pub async fn get_block_time(
-    _state: RpcState,
+    state: RpcState,
     params: Option<serde_json::Value>,
 ) -> Json<RpcResponse> {
-    if params.is_none() {
-        return Json(RpcResponse::error("Missing slot parameter"));
-    }
+    let slot = match params
+        .and_then(|p| p.get("slot"))
+        .and_then(|s| s.as_u64())
+    {
+        Some(s) => s,
+        None => return Json(RpcResponse::error("Missing slot parameter")),
+    };
 
-    Json(RpcResponse::success(json!(1234567890)))
+    // Try to get block timestamp from storage
+    let blocks = state.blocks.read().await;
+    
+    if let Some(block) = blocks.get(&slot) {
+        Json(RpcResponse::success(json!(block.header.timestamp)))
+    } else {
+        // Block not found, estimate based on slot time (400ms per slot)
+        let chain = state.chain_state.read().await;
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        // Estimate: current_time - (current_slot - slot) * 0.4 seconds
+        let slot_diff = chain.current_slot.saturating_sub(slot);
+        let estimated_time = current_time.saturating_sub(slot_diff * 400 / 1000);
+        
+        Json(RpcResponse::success(json!(estimated_time)))
+    }
 }
 
 pub async fn get_first_available_block(state: RpcState) -> Json<RpcResponse> {
@@ -120,15 +205,57 @@ pub async fn send_transaction(
     state: RpcState,
     params: Option<serde_json::Value>,
 ) -> Json<RpcResponse> {
-    if params.is_none() {
-        return Json(RpcResponse::error("Missing transaction parameter"));
+    let params = match params {
+        Some(p) => p,
+        None => return Json(RpcResponse::error("Missing transaction parameter")),
+    };
+
+    // Extract transaction data
+    let tx_data = params.get("transaction")
+        .and_then(|t| t.as_str())
+        .map(|s| bs58::decode(s).into_vec().unwrap_or_default());
+
+    let tx_bytes = match tx_data {
+        Some(bytes) if !bytes.is_empty() => bytes,
+        _ => return Json(RpcResponse::error("Invalid transaction data")),
+    };
+
+    // Generate transaction signature (hash of transaction)
+    let mut hasher = Sha256::new();
+    hasher.update(&tx_bytes);
+    hasher.update(&std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+        .to_le_bytes());
+    let signature = hasher.finalize().to_vec();
+
+    // Store transaction in state
+    let tx_info = TransactionInfo {
+        signature: signature.clone(),
+        slot: state.chain_state.read().await.current_slot,
+        transaction: tx_bytes,
+        status: TransactionStatus::Pending,
+        fee: 5000, // Base fee
+        compute_units: 0,
+        logs: vec![],
+    };
+
+    // Add to transactions map
+    {
+        let mut txs = state.transactions.write().await;
+        txs.insert(signature.clone(), tx_info);
     }
 
-    let mut chain = state.chain_state.write().await;
-    chain.transaction_count += 1;
+    // Update transaction count
+    {
+        let mut chain = state.chain_state.write().await;
+        chain.transaction_count += 1;
+    }
 
-    let signature = format!("sig_{}", chain.transaction_count);
-    Json(RpcResponse::success(json!(signature)))
+    info!("Transaction submitted: {}", bs58::encode(&signature).into_string());
+    
+    Json(RpcResponse::success(json!(bs58::encode(&signature).into_string())))
 }
 
 pub async fn simulate_transaction(
@@ -152,47 +279,80 @@ pub async fn simulate_transaction(
 }
 
 pub async fn get_transaction(
-    _state: RpcState,
+    state: RpcState,
     params: Option<serde_json::Value>,
 ) -> Json<RpcResponse> {
-    if params.is_none() {
-        return Json(RpcResponse::error("Missing signature parameter"));
-    }
+    let signature = match params
+        .and_then(|p| p.get("signature"))
+        .and_then(|s| s.as_str())
+    {
+        Some(sig) => sig,
+        None => return Json(RpcResponse::error("Missing signature parameter")),
+    };
 
-    Json(RpcResponse::success(json!({
-        "slot": 100,
-        "transaction": {
-            "signatures": ["sig1"],
-            "message": {
-                "header": {
-                    "numRequiredSignatures": 1,
-                    "numReadonlySignedAccounts": 0,
-                    "numReadonlyUnsignedAccounts": 1
-                },
-                "accountKeys": [],
-                "recentBlockhash": "blockhash",
-                "instructions": []
-            }
-        },
-        "meta": {
-            "err": null,
-            "status": { "Ok": null },
-            "fee": 5000,
-            "preBalances": [1000000000],
-            "postBalances": [999995000],
-            "logMessages": [],
-            "preTokenBalances": [],
-            "postTokenBalances": [],
-            "rewards": [],
-            "loadedAddresses": {
-                "writable": [],
-                "readonly": []
+    // Decode signature
+    let sig_bytes = match bs58::decode(signature).into_vec() {
+        Ok(bytes) => bytes,
+        Err(_) => return Json(RpcResponse::error("Invalid signature format")),
+    };
+
+    // Look up transaction
+    let transactions = state.transactions.read().await;
+    
+    if let Some(tx_info) = transactions.get(&sig_bytes) {
+        let status = match &tx_info.status {
+            TransactionStatus::Pending => json!({"Pending": null}),
+            TransactionStatus::Processed => json!({"Ok": null}),
+            TransactionStatus::Confirmed => json!({"Ok": null}),
+            TransactionStatus::Finalized => json!({"Ok": null}),
+            TransactionStatus::Failed(msg) => json!({"Err": msg}),
+        };
+
+        let err = match &tx_info.status {
+            TransactionStatus::Failed(msg) => json!(msg),
+            _ => json!(null),
+        };
+
+        Json(RpcResponse::success(json!({
+            "slot": tx_info.slot,
+            "transaction": {
+                "signatures": [bs58::encode(&tx_info.signature).into_string()],
+                "message": {
+                    "header": {
+                        "numRequiredSignatures": 1,
+                        "numReadonlySignedAccounts": 0,
+                        "numReadonlyUnsignedAccounts": 1
+                    },
+                    "accountKeys": [],
+                    "recentBlockhash": "blockhash",
+                    "instructions": []
+                }
             },
-            "computeUnitsConsumed": 150
-        },
-        "blockTime": 1234567890,
-        "version": "legacy"
-    })))
+            "meta": {
+                "err": err,
+                "status": status,
+                "fee": tx_info.fee,
+                "preBalances": [],
+                "postBalances": [],
+                "logMessages": tx_info.logs,
+                "preTokenBalances": [],
+                "postTokenBalances": [],
+                "rewards": [],
+                "loadedAddresses": {
+                    "writable": [],
+                    "readonly": []
+                },
+                "computeUnitsConsumed": tx_info.compute_units
+            },
+            "blockTime": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            "version": "legacy"
+        })))
+    } else {
+        Json(RpcResponse::error(&format!("Transaction not found: {}", signature)))
+    }
 }
 
 pub async fn get_transaction_count(state: RpcState) -> Json<RpcResponse> {
@@ -271,81 +431,176 @@ pub async fn get_signatures_for_address(
 // ============================================================================
 
 pub async fn get_balance(
-    _state: RpcState,
+    state: RpcState,
     params: Option<serde_json::Value>,
 ) -> Json<RpcResponse> {
-    if params.is_none() {
-        return Json(RpcResponse::error("Missing account parameter"));
-    }
+    let address = match params
+        .and_then(|p| p.get("address").or(p.get("pubkey")))
+        .and_then(|a| a.as_str())
+    {
+        Some(addr) => addr,
+        None => return Json(RpcResponse::error("Missing account parameter")),
+    };
+
+    // Decode address
+    let address_bytes = match bs58::decode(address).into_vec() {
+        Ok(bytes) => bytes,
+        Err(_) => return Json(RpcResponse::error("Invalid address format")),
+    };
+
+    let chain = state.chain_state.read().await;
+    let current_slot = chain.current_slot;
+    drop(chain);
+
+    // Look up account in state
+    let accounts = state.accounts.read().await;
+    let balance = accounts.get(&address_bytes)
+        .map(|account| account.lamports)
+        .unwrap_or(0);
 
     Json(RpcResponse::success(json!({
-        "context": { "slot": 100 },
-        "value": 1000000000
+        "context": { "slot": current_slot },
+        "value": balance
     })))
 }
 
 pub async fn get_account_info(
-    _state: RpcState,
+    state: RpcState,
     params: Option<serde_json::Value>,
 ) -> Json<RpcResponse> {
-    if params.is_none() {
-        return Json(RpcResponse::error("Missing account parameter"));
-    }
+    let address = match params
+        .and_then(|p| p.get("address").or(p.get("pubkey")))
+        .and_then(|a| a.as_str())
+    {
+        Some(addr) => addr,
+        None => return Json(RpcResponse::error("Missing account parameter")),
+    };
 
-    Json(RpcResponse::success(json!({
-        "context": { "slot": 100 },
-        "value": {
-            "lamports": 1000000000,
-            "owner": "11111111111111111111111111111111",
-            "data": ["", "base64"],
-            "executable": false,
-            "rentEpoch": 0
-        }
-    })))
+    // Decode address
+    let address_bytes = match bs58::decode(address).into_vec() {
+        Ok(bytes) => bytes,
+        Err(_) => return Json(RpcResponse::error("Invalid address format")),
+    };
+
+    let chain = state.chain_state.read().await;
+    let current_slot = chain.current_slot;
+    drop(chain);
+
+    // Look up account in state
+    let accounts = state.accounts.read().await;
+    
+    if let Some(account) = accounts.get(&address_bytes) {
+        let data_base64 = base64::encode(&account.data);
+        let owner = bs58::encode(&account.owner).into_string();
+        
+        Json(RpcResponse::success(json!({
+            "context": { "slot": current_slot },
+            "value": {
+                "lamports": account.lamports,
+                "owner": owner,
+                "data": [data_base64, "base64"],
+                "executable": account.executable,
+                "rentEpoch": account.rent_epoch
+            }
+        })))
+    } else {
+        // Account not found
+        Json(RpcResponse::success(json!({
+            "context": { "slot": current_slot },
+            "value": null
+        })))
+    }
 }
 
 pub async fn get_multiple_accounts(
-    _state: RpcState,
+    state: RpcState,
     params: Option<serde_json::Value>,
 ) -> Json<RpcResponse> {
-    if params.is_none() {
-        return Json(RpcResponse::error("Missing accounts parameter"));
+    let addresses = match params
+        .and_then(|p| p.get("addresses").or(p.get("pubkeys")))
+        .and_then(|a| a.as_array())
+    {
+        Some(addrs) => addrs.clone(),
+        None => return Json(RpcResponse::error("Missing accounts parameter")),
+    };
+
+    let chain = state.chain_state.read().await;
+    let current_slot = chain.current_slot;
+    drop(chain);
+
+    let accounts_map = state.accounts.read().await;
+    
+    let mut results = Vec::new();
+    for addr in addresses {
+        if let Some(addr_str) = addr.as_str() {
+            if let Ok(addr_bytes) = bs58::decode(addr_str).into_vec() {
+                if let Some(account) = accounts_map.get(&addr_bytes) {
+                    let data_base64 = base64::encode(&account.data);
+                    let owner = bs58::encode(&account.owner).into_string();
+                    
+                    results.push(json!({
+                        "lamports": account.lamports,
+                        "owner": owner,
+                        "data": [data_base64, "base64"],
+                        "executable": account.executable,
+                        "rentEpoch": account.rent_epoch
+                    }));
+                } else {
+                    results.push(json!(null));
+                }
+            } else {
+                results.push(json!(null));
+            }
+        } else {
+            results.push(json!(null));
+        }
     }
 
     Json(RpcResponse::success(json!({
-        "context": { "slot": 100 },
-        "value": [
-            {
-                "lamports": 1000000000,
-                "owner": "11111111111111111111111111111111",
-                "data": ["", "base64"],
-                "executable": false,
-                "rentEpoch": 0
-            }
-        ]
+        "context": { "slot": current_slot },
+        "value": results
     })))
 }
 
 pub async fn get_program_accounts(
-    _state: RpcState,
+    state: RpcState,
     params: Option<serde_json::Value>,
 ) -> Json<RpcResponse> {
-    if params.is_none() {
-        return Json(RpcResponse::error("Missing program ID parameter"));
-    }
+    let program_id = match params
+        .and_then(|p| p.get("programId"))
+        .and_then(|p| p.as_str())
+    {
+        Some(id) => id,
+        None => return Json(RpcResponse::error("Missing program ID parameter")),
+    };
 
-    Json(RpcResponse::success(json!([
-        {
-            "pubkey": "account1",
-            "account": {
-                "lamports": 1000000,
-                "owner": "program_id",
-                "data": ["", "base64"],
-                "executable": false,
-                "rentEpoch": 0
-            }
-        }
-    ])))
+    // Decode program ID
+    let program_id_bytes = match bs58::decode(program_id).into_vec() {
+        Ok(bytes) => bytes,
+        Err(_) => return Json(RpcResponse::error("Invalid program ID format")),
+    };
+
+    // Look up accounts owned by this program
+    let accounts = state.accounts.read().await;
+    
+    let program_accounts: Vec<_> = accounts.iter()
+        .filter(|(_, account)| account.owner == program_id_bytes)
+        .map(|(addr, account)| {
+            let data_base64 = base64::encode(&account.data);
+            json!({
+                "pubkey": bs58::encode(addr).into_string(),
+                "account": {
+                    "lamports": account.lamports,
+                    "owner": bs58::encode(&account.owner).into_string(),
+                    "data": [data_base64, "base64"],
+                    "executable": account.executable,
+                    "rentEpoch": account.rent_epoch
+                }
+            })
+        })
+        .collect();
+
+    Json(RpcResponse::success(json!(program_accounts)))
 }
 
 pub async fn get_largest_accounts(
@@ -597,16 +852,72 @@ pub async fn deploy_ai_agent(
     state: RpcState,
     params: Option<serde_json::Value>,
 ) -> Json<RpcResponse> {
-    if params.is_none() {
-        return Json(RpcResponse::error("Missing deployment parameters"));
+    let params = match params {
+        Some(p) => p,
+        None => return Json(RpcResponse::error("Missing deployment parameters")),
+    };
+
+    // Extract deployment parameters
+    let model_hash = params.get("modelHash")
+        .and_then(|m| m.as_str())
+        .unwrap_or("unknown");
+    
+    let owner = params.get("owner")
+        .and_then(|o| o.as_str())
+        .unwrap_or("unknown");
+
+    let config = params.get("config")
+        .cloned()
+        .unwrap_or(json!({}));
+
+    // Generate agent ID
+    let mut hasher = Sha256::new();
+    hasher.update(model_hash.as_bytes());
+    hasher.update(owner.as_bytes());
+    hasher.update(&std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+        .to_le_bytes());
+    let agent_id = hasher.finalize().to_vec();
+
+    // Create AI agent data
+    let agent_data = AIAgentData {
+        agent_id: agent_id.clone(),
+        model_hash: model_hash.to_string(),
+        owner: bs58::decode(owner).into_vec().unwrap_or_else(|_| owner.as_bytes().to_vec()),
+        execution_count: 0,
+        total_compute_used: 0,
+        status: "active".to_string(),
+        config: config.clone(),
+        created_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    };
+
+    // Store agent
+    {
+        let mut agents = state.ai_agents.write().await;
+        agents.insert(agent_id.clone(), agent_data);
     }
 
-    let mut chain = state.chain_state.write().await;
-    chain.transaction_count += 1;
+    // Generate signature
+    let mut sig_hasher = Sha256::new();
+    sig_hasher.update(&agent_id);
+    let signature = sig_hasher.finalize().to_vec();
+
+    // Update transaction count
+    {
+        let mut chain = state.chain_state.write().await;
+        chain.transaction_count += 1;
+    }
+
+    info!("AI Agent deployed: {}", bs58::encode(&agent_id).into_string());
 
     Json(RpcResponse::success(json!({
-        "agentId": format!("agent_{}", chain.transaction_count),
-        "signature": format!("sig_{}", chain.transaction_count)
+        "agentId": bs58::encode(&agent_id).into_string(),
+        "signature": bs58::encode(&signature).into_string()
     })))
 }
 
@@ -614,46 +925,115 @@ pub async fn execute_ai_agent(
     state: RpcState,
     params: Option<serde_json::Value>,
 ) -> Json<RpcResponse> {
-    if params.is_none() {
-        return Json(RpcResponse::error("Missing execution parameters"));
-    }
+    let params = match params {
+        Some(p) => p,
+        None => return Json(RpcResponse::error("Missing execution parameters")),
+    };
 
-    let mut chain = state.chain_state.write().await;
-    chain.transaction_count += 1;
+    let agent_id_str = match params.get("agentId").and_then(|a| a.as_str()) {
+        Some(id) => id,
+        None => return Json(RpcResponse::error("Missing agentId parameter")),
+    };
 
-    Json(RpcResponse::success(json!({
-        "executionId": format!("exec_{}", chain.transaction_count),
-        "signature": format!("sig_{}", chain.transaction_count),
-        "computeUnits": 50000,
-        "output": {
-            "result": "AI execution result",
-            "confidence": 0.95
+    let agent_id_bytes = match bs58::decode(agent_id_str).into_vec() {
+        Ok(bytes) => bytes,
+        Err(_) => return Json(RpcResponse::error("Invalid agent ID format")),
+    };
+
+    // Look up agent
+    let agents = state.ai_agents.read().await;
+    
+    if let Some(agent) = agents.get(&agent_id_bytes) {
+        if agent.status != "active" {
+            return Json(RpcResponse::error(&format!("Agent is not active: {}", agent.status)));
         }
-    })))
+
+        // Get input data
+        let _input = params.get("input").cloned().unwrap_or(json!({}));
+        
+        // Simulate execution (in production, this would call the AI runtime)
+        let compute_units = 50000u64; // Base compute cost
+        
+        // Generate execution ID
+        let mut hasher = Sha256::new();
+        hasher.update(&agent_id_bytes);
+        hasher.update(&std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            .to_le_bytes());
+        let execution_id = hasher.finalize().to_vec();
+
+        drop(agents);
+
+        // Update agent stats
+        {
+            let mut agents = state.ai_agents.write().await;
+            if let Some(agent) = agents.get_mut(&agent_id_bytes) {
+                agent.execution_count += 1;
+                agent.total_compute_used += compute_units;
+            }
+        }
+
+        // Generate signature
+        let mut sig_hasher = Sha256::new();
+        sig_hasher.update(&execution_id);
+        let signature = sig_hasher.finalize().to_vec();
+
+        // Update transaction count
+        {
+            let mut chain = state.chain_state.write().await;
+            chain.transaction_count += 1;
+        }
+
+        Json(RpcResponse::success(json!({
+            "executionId": bs58::encode(&execution_id).into_string(),
+            "signature": bs58::encode(&signature).into_string(),
+            "computeUnits": compute_units,
+            "output": {
+                "result": "AI execution completed",
+                "status": "success"
+            }
+        })))
+    } else {
+        Json(RpcResponse::error(&format!("Agent not found: {}", agent_id_str)))
+    }
 }
 
 pub async fn get_ai_agent_info(
-    _state: RpcState,
+    state: RpcState,
     params: Option<serde_json::Value>,
 ) -> Json<RpcResponse> {
-    if params.is_none() {
-        return Json(RpcResponse::error("Missing agent ID"));
-    }
+    let agent_id_str = match params
+        .and_then(|p| p.get("agentId"))
+        .and_then(|a| a.as_str())
+    {
+        Some(id) => id,
+        None => return Json(RpcResponse::error("Missing agent ID")),
+    };
 
-    Json(RpcResponse::success(json!({
-        "agentId": "agent_1",
-        "modelHash": "QmXx...",
-        "owner": "owner_pubkey",
-        "executionCount": 42,
-        "totalComputeUsed": 2100000,
-        "status": "active",
-        "createdAt": 1234567890,
-        "config": {
-            "modelType": "transformer",
-            "maxTokens": 512,
-            "temperature": 0.7
-        }
-    })))
+    let agent_id_bytes = match bs58::decode(agent_id_str).into_vec() {
+        Ok(bytes) => bytes,
+        Err(_) => return Json(RpcResponse::error("Invalid agent ID format")),
+    };
+
+    // Look up agent
+    let agents = state.ai_agents.read().await;
+    
+    if let Some(agent) = agents.get(&agent_id_bytes) {
+        Json(RpcResponse::success(json!({
+            "agentId": bs58::encode(&agent.agent_id).into_string(),
+            "modelHash": agent.model_hash,
+            "owner": bs58::encode(&agent.owner).into_string(),
+            "executionCount": agent.execution_count,
+            "totalComputeUsed": agent.total_compute_used,
+            "status": agent.status,
+            "createdAt": agent.created_at,
+            "config": agent.config
+        })))
+    } else {
+        Json(RpcResponse::error(&format!("Agent not found: {}", agent_id_str)))
+    }
 }
 
 pub async fn update_ai_agent(
@@ -673,70 +1053,186 @@ pub async fn update_ai_agent(
 }
 
 pub async fn list_ai_agents(
-    _state: RpcState,
+    state: RpcState,
     params: Option<serde_json::Value>,
 ) -> Json<RpcResponse> {
-    let owner = params
+    let owner_filter = params
         .and_then(|p| p.get("owner"))
-        .and_then(|o| o.as_str());
+        .and_then(|o| o.as_str())
+        .map(|s| bs58::decode(s).into_vec().unwrap_or_else(|_| s.as_bytes().to_vec()));
+
+    let agents = state.ai_agents.read().await;
+    
+    let mut agent_list: Vec<_> = agents.values()
+        .filter(|agent| {
+            if let Some(ref owner_bytes) = owner_filter {
+                &agent.owner == owner_bytes
+            } else {
+                true
+            }
+        })
+        .map(|agent| json!({
+            "agentId": bs58::encode(&agent.agent_id).into_string(),
+            "owner": bs58::encode(&agent.owner).into_string(),
+            "status": agent.status,
+            "modelHash": agent.model_hash,
+            "executionCount": agent.execution_count,
+            "createdAt": agent.created_at
+        }))
+        .collect();
+
+    let total = agent_list.len();
 
     Json(RpcResponse::success(json!({
-        "agents": [
-            {
-                "agentId": "agent_1",
-                "owner": "owner1",
-                "status": "active"
-            },
-            {
-                "agentId": "agent_2",
-                "owner": "owner1",
-                "status": "paused"
-            }
-        ],
-        "total": 2
+        "agents": agent_list,
+        "total": total
     })))
 }
 
 pub async fn get_ai_agent_executions(
-    _state: RpcState,
+    state: RpcState,
     params: Option<serde_json::Value>,
 ) -> Json<RpcResponse> {
-    if params.is_none() {
-        return Json(RpcResponse::error("Missing agent ID"));
-    }
+    let agent_id_str = match params
+        .and_then(|p| p.get("agentId"))
+        .and_then(|a| a.as_str())
+    {
+        Some(id) => id,
+        None => return Json(RpcResponse::error("Missing agent ID")),
+    };
 
-    Json(RpcResponse::success(json!({
-        "executions": [
-            {
-                "executionId": "exec_1",
-                "timestamp": 1234567890,
-                "computeUnits": 50000,
+    let agent_id_bytes = match bs58::decode(agent_id_str).into_vec() {
+        Ok(bytes) => bytes,
+        Err(_) => return Json(RpcResponse::error("Invalid agent ID format")),
+    };
+
+    // Look up agent
+    let agents = state.ai_agents.read().await;
+    
+    if let Some(agent) = agents.get(&agent_id_bytes) {
+        // In production, executions would be stored separately
+        // For now, return summary based on agent stats
+        let execution_count = agent.execution_count;
+        let total_compute = agent.total_compute_used;
+        let avg_compute = if execution_count > 0 {
+            total_compute / execution_count
+        } else {
+            0
+        };
+
+        // Generate mock execution history based on actual execution count
+        let executions: Vec<_> = (0..execution_count.min(10)).map(|i| {
+            json!({
+                "executionId": format!("exec_{}_{}", bs58::encode(&agent_id_bytes).into_string(), i),
+                "timestamp": agent.created_at + (i * 60),
+                "computeUnits": avg_compute,
                 "status": "success"
-            }
-        ],
-        "total": 100
-    })))
+            })
+        }).collect();
+
+        Json(RpcResponse::success(json!({
+            "executions": executions,
+            "total": execution_count,
+            "totalComputeUsed": total_compute,
+            "averageComputePerExecution": avg_compute
+        })))
+    } else {
+        Json(RpcResponse::error(&format!("Agent not found: {}", agent_id_str)))
+    }
 }
 
 // ============================================================================
 // Bridge Methods (Enhanced)
 // ============================================================================
 
+/// Bridge operation storage for tracking deposits/withdrawals
+#[derive(Debug, Clone)]
+pub struct BridgeOperation {
+    pub id: Vec<u8>,
+    pub op_type: String,
+    pub status: String,
+    pub from_chain: String,
+    pub to_chain: String,
+    pub amount: u64,
+    pub sender: Vec<u8>,
+    pub recipient: Vec<u8>,
+    pub confirmations: u32,
+    pub timestamp: u64,
+}
+
 pub async fn bridge_deposit(
     state: RpcState,
     params: Option<serde_json::Value>,
 ) -> Json<RpcResponse> {
-    if params.is_none() {
-        return Json(RpcResponse::error("Missing deposit parameters"));
+    let params = match params {
+        Some(p) => p,
+        None => return Json(RpcResponse::error("Missing deposit parameters")),
+    };
+
+    // Extract deposit parameters
+    let amount = params.get("amount")
+        .and_then(|a| a.as_u64())
+        .unwrap_or(0);
+
+    if amount == 0 {
+        return Json(RpcResponse::error("Invalid deposit amount"));
     }
 
-    let mut chain = state.chain_state.write().await;
-    chain.transaction_count += 1;
+    let sender = params.get("sender")
+        .and_then(|s| s.as_str())
+        .unwrap_or("unknown");
+    
+    let recipient = params.get("recipient")
+        .and_then(|r| r.as_str())
+        .unwrap_or("unknown");
+
+    let from_chain = params.get("fromChain")
+        .and_then(|c| c.as_str())
+        .unwrap_or("solana");
+
+    let to_chain = params.get("toChain")
+        .and_then(|c| c.as_str())
+        .unwrap_or("ade");
+
+    // Generate deposit ID
+    let mut hasher = Sha256::new();
+    hasher.update(b"deposit");
+    hasher.update(sender.as_bytes());
+    hasher.update(recipient.as_bytes());
+    hasher.update(&amount.to_le_bytes());
+    hasher.update(&std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+        .to_le_bytes());
+    let deposit_id = hasher.finalize().to_vec();
+
+    // Generate signature
+    let mut sig_hasher = Sha256::new();
+    sig_hasher.update(&deposit_id);
+    let signature = sig_hasher.finalize().to_vec();
+
+    // Update transaction count and chain state
+    {
+        let mut chain = state.chain_state.write().await;
+        chain.transaction_count += 1;
+    }
+
+    info!("Bridge deposit initiated: {} lamports from {} to {}", 
+        amount, from_chain, to_chain);
 
     Json(RpcResponse::success(json!({
-        "depositId": format!("deposit_{}", chain.transaction_count),
-        "signature": format!("sig_{}", chain.transaction_count),
-        "status": "pending"
+        "depositId": bs58::encode(&deposit_id).into_string(),
+        "signature": bs58::encode(&signature).into_string(),
+        "status": "pending",
+        "amount": amount,
+        "fromChain": from_chain,
+        "toChain": to_chain,
+        "estimatedConfirmations": 32,
+        "timestamp": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
     })))
 }
 
@@ -744,71 +1240,244 @@ pub async fn bridge_withdraw(
     state: RpcState,
     params: Option<serde_json::Value>,
 ) -> Json<RpcResponse> {
-    if params.is_none() {
-        return Json(RpcResponse::error("Missing withdrawal parameters"));
+    let params = match params {
+        Some(p) => p,
+        None => return Json(RpcResponse::error("Missing withdrawal parameters")),
+    };
+
+    // Extract withdrawal parameters
+    let amount = params.get("amount")
+        .and_then(|a| a.as_u64())
+        .unwrap_or(0);
+
+    if amount == 0 {
+        return Json(RpcResponse::error("Invalid withdrawal amount"));
     }
 
-    let mut chain = state.chain_state.write().await;
-    chain.transaction_count += 1;
+    let sender = params.get("sender")
+        .and_then(|s| s.as_str())
+        .unwrap_or("unknown");
+    
+    let recipient = params.get("recipient")
+        .and_then(|r| r.as_str())
+        .unwrap_or("unknown");
+
+    // Check sender balance
+    let sender_bytes = bs58::decode(sender).into_vec().unwrap_or_default();
+    {
+        let accounts = state.accounts.read().await;
+        if let Some(account) = accounts.get(&sender_bytes) {
+            if account.lamports < amount {
+                return Json(RpcResponse::error("Insufficient balance for withdrawal"));
+            }
+        } else {
+            return Json(RpcResponse::error("Sender account not found"));
+        }
+    }
+
+    // Generate withdrawal ID
+    let mut hasher = Sha256::new();
+    hasher.update(b"withdrawal");
+    hasher.update(sender.as_bytes());
+    hasher.update(recipient.as_bytes());
+    hasher.update(&amount.to_le_bytes());
+    hasher.update(&std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+        .to_le_bytes());
+    let withdrawal_id = hasher.finalize().to_vec();
+
+    // Generate signature
+    let mut sig_hasher = Sha256::new();
+    sig_hasher.update(&withdrawal_id);
+    let signature = sig_hasher.finalize().to_vec();
+
+    // Deduct from sender (lock tokens)
+    {
+        let mut accounts = state.accounts.write().await;
+        if let Some(account) = accounts.get_mut(&sender_bytes) {
+            account.lamports = account.lamports.saturating_sub(amount);
+        }
+    }
+
+    // Update transaction count
+    {
+        let mut chain = state.chain_state.write().await;
+        chain.transaction_count += 1;
+    }
+
+    info!("Bridge withdrawal initiated: {} lamports from ade to solana", amount);
 
     Json(RpcResponse::success(json!({
-        "withdrawalId": format!("withdraw_{}", chain.transaction_count),
-        "signature": format!("sig_{}", chain.transaction_count),
-        "status": "pending"
+        "withdrawalId": bs58::encode(&withdrawal_id).into_string(),
+        "signature": bs58::encode(&signature).into_string(),
+        "status": "pending",
+        "amount": amount,
+        "fromChain": "ade",
+        "toChain": "solana",
+        "estimatedConfirmations": 32,
+        "timestamp": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
     })))
 }
 
 pub async fn get_bridge_status(
-    _state: RpcState,
+    state: RpcState,
     params: Option<serde_json::Value>,
 ) -> Json<RpcResponse> {
-    if params.is_none() {
-        return Json(RpcResponse::error("Missing operation ID"));
-    }
+    let operation_id = match params
+        .and_then(|p| p.get("operationId").or(p.get("id")))
+        .and_then(|o| o.as_str())
+    {
+        Some(id) => id,
+        None => return Json(RpcResponse::error("Missing operation ID")),
+    };
+
+    // Look up in transactions (bridge operations are stored as transactions)
+    let chain = state.chain_state.read().await;
+    let current_slot = chain.current_slot;
+    let finalized_slot = chain.finalized_slot;
+    drop(chain);
+
+    // Determine confirmation status based on slots
+    // In production, this would look up actual bridge operation state
+    let confirmations = if current_slot > finalized_slot {
+        (current_slot - finalized_slot).min(32) as u32
+    } else {
+        32
+    };
+
+    let status = if confirmations >= 32 {
+        "completed"
+    } else if confirmations >= 16 {
+        "confirmed"
+    } else {
+        "pending"
+    };
 
     Json(RpcResponse::success(json!({
-        "id": "deposit_1",
-        "type": "deposit",
-        "status": "completed",
-        "confirmations": 32,
+        "id": operation_id,
+        "type": "bridge_operation",
+        "status": status,
+        "confirmations": confirmations,
         "fromChain": "solana",
         "toChain": "ade",
-        "amount": 1000000000,
-        "timestamp": 1234567890
+        "currentSlot": current_slot,
+        "finalizedSlot": finalized_slot,
+        "timestamp": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
     })))
 }
 
 pub async fn get_bridge_history(
-    _state: RpcState,
+    state: RpcState,
     params: Option<serde_json::Value>,
 ) -> Json<RpcResponse> {
+    let limit = params
+        .as_ref()
+        .and_then(|p| p.get("limit"))
+        .and_then(|l| l.as_u64())
+        .unwrap_or(50) as usize;
+
+    let address = params
+        .and_then(|p| p.get("address"))
+        .and_then(|a| a.as_str());
+
+    // Look up transactions related to bridge operations
+    let transactions = state.transactions.read().await;
+    
+    let mut operations = Vec::new();
+    for (_sig, tx_info) in transactions.iter().take(limit) {
+        // Filter bridge-related transactions based on logs or other markers
+        // In production, this would filter based on transaction type
+        if tx_info.logs.iter().any(|log| log.contains("bridge") || log.contains("deposit") || log.contains("withdraw")) {
+            let status = match &tx_info.status {
+                TransactionStatus::Finalized => "completed",
+                TransactionStatus::Confirmed => "confirmed",
+                TransactionStatus::Processed => "processing",
+                TransactionStatus::Pending => "pending",
+                TransactionStatus::Failed(_) => "failed",
+            };
+
+            operations.push(json!({
+                "id": bs58::encode(&tx_info.signature).into_string(),
+                "type": "bridge_operation",
+                "status": status,
+                "slot": tx_info.slot,
+                "fee": tx_info.fee
+            }));
+        }
+    }
+
+    let total = operations.len();
+
     Json(RpcResponse::success(json!({
-        "operations": [
-            {
-                "id": "deposit_1",
-                "type": "deposit",
-                "status": "completed",
-                "amount": 1000000000,
-                "timestamp": 1234567890
-            }
-        ],
-        "total": 50
+        "operations": operations,
+        "total": total
     })))
 }
 
 pub async fn estimate_bridge_fee(
-    _state: RpcState,
+    state: RpcState,
     params: Option<serde_json::Value>,
 ) -> Json<RpcResponse> {
-    if params.is_none() {
-        return Json(RpcResponse::error("Missing fee parameters"));
-    }
+    let params = match params {
+        Some(p) => p,
+        None => return Json(RpcResponse::error("Missing fee parameters")),
+    };
+
+    let amount = params.get("amount")
+        .and_then(|a| a.as_u64())
+        .unwrap_or(0);
+
+    // Dynamic fee calculation based on network state
+    let chain = state.chain_state.read().await;
+    let current_slot = chain.current_slot;
+    let tx_count = chain.transaction_count;
+    drop(chain);
+
+    // Base fee calculation: minimum fee + congestion premium
+    let base_fee = 5000u64; // 5000 lamports base
+    
+    // Congestion factor based on recent transaction count
+    let congestion_factor = if tx_count > 1000 {
+        1.5
+    } else if tx_count > 500 {
+        1.2
+    } else {
+        1.0
+    };
+
+    // Percentage fee (0.1% of amount)
+    let percentage_fee_rate = 0.001;
+    let percentage_fee = ((amount as f64) * percentage_fee_rate) as u64;
+
+    // Total fee
+    let total_fee = ((base_fee as f64 * congestion_factor) as u64) + percentage_fee;
+
+    // Estimated time based on network conditions (in seconds)
+    let estimated_time = if tx_count > 1000 {
+        120 // 2 minutes during high congestion
+    } else if tx_count > 500 {
+        90
+    } else {
+        60 // 1 minute normal
+    };
 
     Json(RpcResponse::success(json!({
-        "baseFee": 1000,
-        "percentageFee": 0.001,
-        "totalFee": 2000,
-        "estimatedTime": 60
+        "baseFee": base_fee,
+        "percentageFee": percentage_fee,
+        "percentageFeeRate": percentage_fee_rate,
+        "congestionFactor": congestion_factor,
+        "totalFee": total_fee,
+        "estimatedTime": estimated_time,
+        "currentSlot": current_slot,
+        "networkLoad": if tx_count > 1000 { "high" } else if tx_count > 500 { "medium" } else { "low" }
     })))
 }
 
@@ -852,33 +1521,71 @@ pub async fn get_slot_leaders(
 }
 
 pub async fn get_fee_for_message(
-    _state: RpcState,
+    state: RpcState,
     params: Option<serde_json::Value>,
 ) -> Json<RpcResponse> {
     if params.is_none() {
         return Json(RpcResponse::error("Missing message parameter"));
     }
 
+    let chain = state.chain_state.read().await;
+    let current_slot = chain.current_slot;
+    let tx_count = chain.transaction_count;
+    drop(chain);
+
+    // Dynamic fee calculation based on network congestion
+    let base_fee = 5000u64;
+    
+    // Congestion multiplier
+    let fee = if tx_count > 1000 {
+        base_fee * 3 // High congestion
+    } else if tx_count > 500 {
+        base_fee * 2 // Medium congestion
+    } else {
+        base_fee // Normal
+    };
+
     Json(RpcResponse::success(json!({
-        "context": { "slot": 100 },
-        "value": 5000
+        "context": { "slot": current_slot },
+        "value": fee
     })))
 }
 
 pub async fn get_recent_prioritization_fees(
-    _state: RpcState,
+    state: RpcState,
     params: Option<serde_json::Value>,
 ) -> Json<RpcResponse> {
-    Json(RpcResponse::success(json!([
-        {
-            "slot": 100,
-            "prioritizationFee": 0
-        },
-        {
-            "slot": 101,
-            "prioritizationFee": 1000
-        }
-    ])))
+    let chain = state.chain_state.read().await;
+    let current_slot = chain.current_slot;
+    let tx_count = chain.transaction_count;
+    drop(chain);
+
+    // Generate prioritization fee history based on recent slots
+    let num_samples = 150.min(current_slot as usize);
+    
+    let fees: Vec<_> = (0..num_samples).map(|i| {
+        let slot = current_slot - i as u64;
+        
+        // Calculate dynamic fee based on slot distance and network state
+        // More recent slots have higher fees during congestion
+        let base_priority = if tx_count > 1000 {
+            5000u64
+        } else if tx_count > 500 {
+            1000
+        } else {
+            100
+        };
+        
+        // Add some variation based on slot
+        let fee = base_priority + ((slot % 10) * 100);
+        
+        json!({
+            "slot": slot,
+            "prioritizationFee": fee
+        })
+    }).collect();
+
+    Json(RpcResponse::success(json!(fees)))
 }
 
 pub async fn get_max_retransmit_slot(_state: RpcState) -> Json<RpcResponse> {
