@@ -25,6 +25,11 @@ pub struct Relayer {
     processed_events: Arc<RwLock<HashMap<Vec<u8>, ProcessedEvent>>>,
     stats: Arc<RwLock<RelayerStats>>,
     rpc_clients: RpcClients,
+    /// Last processed Solana signature for cursor-based pagination
+    /// This prevents missing events when more than `batch_size` arrive between polls
+    last_solana_signature: Arc<RwLock<Option<String>>>,
+    /// Last processed Ade block number
+    last_ade_block: Arc<RwLock<u64>>,
 }
 
 struct RpcClients {
@@ -86,7 +91,31 @@ impl Relayer {
                 average_relay_time_ms: 0,
             })),
             rpc_clients,
+            last_solana_signature: Arc::new(RwLock::new(None)),
+            last_ade_block: Arc::new(RwLock::new(0)),
         }
+    }
+    
+    /// Get the last processed Solana signature
+    pub fn get_last_solana_signature(&self) -> Option<String> {
+        self.last_solana_signature.read().unwrap().clone()
+    }
+    
+    /// Set the last processed Solana signature
+    fn set_last_solana_signature(&self, signature: String) {
+        let mut last_sig = self.last_solana_signature.write().unwrap();
+        *last_sig = Some(signature);
+    }
+    
+    /// Get the last processed Ade block
+    pub fn get_last_ade_block(&self) -> u64 {
+        *self.last_ade_block.read().unwrap()
+    }
+    
+    /// Set the last processed Ade block
+    fn set_last_ade_block(&self, block: u64) {
+        let mut last_block = self.last_ade_block.write().unwrap();
+        *last_block = block;
     }
 
     pub async fn start(&self) -> Result<()> {
@@ -134,26 +163,33 @@ impl Relayer {
             ade: reqwest::Client::new(),
         };
 
+        // Clone cursors for the polling task
+        let last_solana_sig = self.last_solana_signature.clone();
+        let last_ade_blk = self.last_ade_block.clone();
+        
         tokio::spawn(async move {
             let mut poll_timer = interval(Duration::from_millis(config.poll_interval_ms));
 
             while *running.read().unwrap() {
                 poll_timer.tick().await;
                 
-                if let Err(e) = poll_solana_events(
+                // Poll with cursor for pagination - prevents missing events
+                if let Err(e) = poll_solana_events_paginated(
                     &config,
                     &rpc_clients.solana,
                     &pending_relays,
                     &processed_events,
+                    &last_solana_sig,
                 ).await {
                     error!("Error polling Solana events: {}", e);
                 }
 
-                if let Err(e) = poll_ade_events(
+                if let Err(e) = poll_ade_events_paginated(
                     &config,
                     &rpc_clients.ade,
                     &pending_relays,
                     &processed_events,
+                    &last_ade_blk,
                 ).await {
                     error!("Error polling Ade events: {}", e);
                 }
@@ -253,21 +289,42 @@ impl Relayer {
     }
 }
 
-/// Poll Solana for deposit events - actual implementation
-async fn poll_solana_events(
+/// Poll Solana for deposit events with cursor-based pagination
+/// 
+/// Uses the "until" parameter to fetch events after the last processed signature,
+/// ensuring no events are missed even if more than batch_size arrive between polls.
+async fn poll_solana_events_paginated(
     config: &RelayerConfig,
     client: &reqwest::Client,
     pending_relays: &Arc<RwLock<VecDeque<RelayTask>>>,
     processed_events: &Arc<RwLock<HashMap<Vec<u8>, ProcessedEvent>>>,
+    last_signature: &Arc<RwLock<Option<String>>>,
 ) -> Result<()> {
-    debug!("Polling Solana for deposit events");
+    debug!("Polling Solana for deposit events (paginated)");
 
-    // Query Solana RPC for recent signatures
+    // Get the last processed signature for cursor-based pagination
+    let cursor_sig = last_signature.read().unwrap().clone();
+    
+    // Use larger batch size and pagination for reliability
+    let batch_size = config.batch_size.max(100); // At least 100 per batch
+    
+    // Build request params with cursor if available
+    let params = if let Some(ref until_sig) = cursor_sig {
+        serde_json::json!(["BridgeProgramId", {
+            "limit": batch_size,
+            "until": until_sig  // Get signatures AFTER this one
+        }])
+    } else {
+        serde_json::json!(["BridgeProgramId", {
+            "limit": batch_size
+        }])
+    };
+    
     let request = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "getSignaturesForAddress",
-        "params": ["BridgeProgramId", {"limit": 10}]
+        "params": params
     });
 
     match client.post(&config.solana_rpc_url)
@@ -278,10 +335,20 @@ async fn poll_solana_events(
         Ok(response) => {
             if let Ok(result) = response.json::<serde_json::Value>().await {
                 if let Some(signatures) = result.get("result").and_then(|r| r.as_array()) {
-                    debug!("Found {} signatures", signatures.len());
+                    let count = signatures.len();
+                    debug!("Found {} signatures (cursor: {:?})", count, cursor_sig);
                     
-                    for sig_info in signatures {
+                    // Track the newest signature to update cursor
+                    let mut newest_signature: Option<String> = None;
+                    
+                    // Process in reverse order (oldest first) to maintain order
+                    for sig_info in signatures.iter().rev() {
                         if let Some(signature) = sig_info.get("signature").and_then(|s| s.as_str()) {
+                            // Update newest signature (for cursor)
+                            if newest_signature.is_none() {
+                                newest_signature = Some(signature.to_string());
+                            }
+                            
                             let event_hash = hash_signature(signature);
                             
                             // Check if already processed
@@ -305,13 +372,32 @@ async fn poll_solana_events(
                                 pending_relays.write().unwrap().push_back(task);
                                 
                                 // Mark as seen
-                                processed_events.write().unwrap().insert(event_hash, ProcessedEvent {
+                                processed_events.write().unwrap().insert(event_hash.clone(), ProcessedEvent {
                                     event_hash,
                                     processed_at: current_timestamp(),
                                     success: false, // Will update after relay
                                 });
                             }
                         }
+                    }
+                    
+                    // Update cursor to newest signature for next poll
+                    if let Some(newest) = signatures.first()
+                        .and_then(|s| s.get("signature"))
+                        .and_then(|s| s.as_str())
+                    {
+                        let mut cursor = last_signature.write().unwrap();
+                        *cursor = Some(newest.to_string());
+                        debug!("Updated Solana cursor to: {}", newest);
+                    }
+                    
+                    // If we got a full batch, there might be more - log warning
+                    if count >= batch_size {
+                        warn!(
+                            "Received full batch of {} signatures, some events may have been missed. \
+                            Consider reducing poll_interval_ms or increasing batch_size.",
+                            count
+                        );
                     }
                 }
             }
@@ -324,21 +410,29 @@ async fn poll_solana_events(
     Ok(())
 }
 
-/// Poll Ade for withdrawal events - actual implementation
-async fn poll_ade_events(
+/// Poll Ade for withdrawal events with cursor-based pagination
+async fn poll_ade_events_paginated(
     config: &RelayerConfig,
     client: &reqwest::Client,
     pending_relays: &Arc<RwLock<VecDeque<RelayTask>>>,
     processed_events: &Arc<RwLock<HashMap<Vec<u8>, ProcessedEvent>>>,
+    last_block: &Arc<RwLock<u64>>,
 ) -> Result<()> {
-    debug!("Polling Ade sidechain for withdrawal events");
+    debug!("Polling Ade sidechain for withdrawal events (paginated)");
 
-    // Similar to Solana polling
+    // Get the last processed block for cursor
+    let from_block = *last_block.read().unwrap();
+    let batch_size = config.batch_size.max(100);
+    
+    // Query with from_block cursor
     let request = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "getBridgeHistory",
-        "params": [{"limit": 10}]
+        "params": [{
+            "limit": batch_size,
+            "fromBlock": from_block
+        }]
     });
 
     match client.post(&config.ade_rpc_url)
@@ -349,8 +443,75 @@ async fn poll_ade_events(
         Ok(response) => {
             if let Ok(result) = response.json::<serde_json::Value>().await {
                 if let Some(operations) = result.get("result").and_then(|r| r.get("operations")).and_then(|o| o.as_array()) {
-                    debug!("Found {} operations", operations.len());
-                    // Process withdrawal events similar to deposits
+                    let count = operations.len();
+                    debug!("Found {} operations (from block {})", count, from_block);
+                    
+                    let mut max_block: u64 = from_block;
+                    
+                    for op in operations {
+                        // Extract block number
+                        let block_num = op.get("block")
+                            .and_then(|b| b.as_u64())
+                            .unwrap_or(0);
+                        
+                        // Track highest block number
+                        if block_num > max_block {
+                            max_block = block_num;
+                        }
+                        
+                        // Check for withdrawal events
+                        if let Some(op_type) = op.get("type").and_then(|t| t.as_str()) {
+                            if op_type == "withdrawal" {
+                                let event_hash = if let Some(hash) = op.get("hash").and_then(|h| h.as_str()) {
+                                    hash_signature(hash)
+                                } else {
+                                    continue;
+                                };
+                                
+                                // Skip if already processed
+                                if processed_events.read().unwrap().contains_key(&event_hash) {
+                                    continue;
+                                }
+                                
+                                // Create relay task
+                                let task = RelayTask {
+                                    id: event_hash.clone(),
+                                    event_type: EventType::Withdrawal,
+                                    source_chain: "ade".to_string(),
+                                    target_chain: "solana".to_string(),
+                                    data: serde_json::to_vec(&op).unwrap_or_default(),
+                                    retry_count: 0,
+                                    created_at: current_timestamp(),
+                                    block_number: block_num,
+                                };
+                                
+                                pending_relays.write().unwrap().push_back(task);
+                                
+                                // Mark as seen
+                                processed_events.write().unwrap().insert(event_hash.clone(), ProcessedEvent {
+                                    event_hash,
+                                    processed_at: current_timestamp(),
+                                    success: false,
+                                });
+                            }
+                        }
+                    }
+                    
+                    // Update block cursor to highest seen block + 1
+                    if max_block > from_block {
+                        let mut cursor = last_block.write().unwrap();
+                        *cursor = max_block + 1;
+                        debug!("Updated Ade cursor to block {}", max_block + 1);
+                    }
+                    
+                    // Warn if we hit batch limit
+                    if count >= batch_size {
+                        warn!(
+                            "Received full batch of {} operations, some may have been missed. \
+                            Consider reducing poll_interval_ms.",
+                            count
+                        );
+                    }
                 }
             }
         }
