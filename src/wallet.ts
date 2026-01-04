@@ -75,43 +75,93 @@ export class Wallet {
 
 /**
  * HD Wallet (Hierarchical Deterministic)
+ * Implements BIP32/BIP44 compliant key derivation for Solana/Ade
  */
 export class HDWallet {
   private seed: Buffer;
+  private masterKey: Buffer;
+  private chainCode: Buffer;
 
   constructor(seed: Buffer) {
     this.seed = seed;
+    // Derive master key and chain code using HMAC-SHA512
+    const hmac = crypto.createHmac('sha512', 'ed25519 seed');
+    hmac.update(seed);
+    const I = hmac.digest();
+    this.masterKey = I.subarray(0, 32);
+    this.chainCode = I.subarray(32, 64);
   }
 
   /**
-   * Create from mnemonic
+   * Create from mnemonic using BIP39 standard
    */
   static fromMnemonic(mnemonic: string, passphrase: string = ''): HDWallet {
-    // In production, use bip39 library
-    const seed = crypto.pbkdf2Sync(mnemonic, passphrase, 2048, 64, 'sha512');
+    // BIP39: Use PBKDF2 with 2048 iterations and mnemonic + "mnemonic" + passphrase as salt
+    const salt = 'mnemonic' + passphrase;
+    const seed = crypto.pbkdf2Sync(mnemonic, salt, 2048, 64, 'sha512');
     return new HDWallet(seed);
   }
 
   /**
-   * Derive keypair at path
+   * Derive keypair at path using SLIP-0010/BIP32-Ed25519
+   * Path format: m/44'/501'/{account}'/0'/{index}'
+   * 44' = BIP44 purpose
+   * 501' = Solana coin type
    */
   derivePath(path: string): Keypair {
-    // Simplified derivation - in production use proper BIP32/44
-    const pathHash = crypto.createHash('sha256').update(path).update(this.seed).digest();
-    const secretKey = new Uint8Array(pathHash);
+    // Parse path components
+    const components = path.replace('m/', '').split('/');
     
-    // Pad to 64 bytes for ed25519
-    const fullKey = new Uint8Array(64);
-    fullKey.set(secretKey);
+    let key = this.masterKey;
+    let chainCode = this.chainCode;
     
-    return Keypair.fromSecretKey(fullKey);
+    for (const component of components) {
+      if (!component) continue;
+      
+      // Check if hardened derivation (ends with ')
+      const hardened = component.endsWith("'");
+      let index = parseInt(hardened ? component.slice(0, -1) : component, 10);
+      
+      if (hardened) {
+        // Add hardened flag (0x80000000)
+        index += 0x80000000;
+      }
+      
+      // Derive child key using HMAC-SHA512
+      const data = Buffer.alloc(37);
+      data[0] = 0x00; // Ed25519 always uses hardened derivation
+      key.copy(data, 1);
+      data.writeUInt32BE(index, 33);
+      
+      const hmac = crypto.createHmac('sha512', chainCode);
+      hmac.update(data);
+      const I = hmac.digest();
+      
+      key = I.subarray(0, 32);
+      chainCode = I.subarray(32, 64);
+    }
+    
+    // Create Ed25519 keypair from derived key
+    // The derived key is the seed for Keypair.fromSeed
+    return Keypair.fromSeed(new Uint8Array(key));
   }
 
   /**
-   * Get wallet at index
+   * Get wallet at index using Solana's derivation path
+   * Standard path: m/44'/501'/{index}'/0'
    */
   getWallet(index: number): Wallet {
     const path = `m/44'/501'/${index}'/0'`;
+    const keypair = this.derivePath(path);
+    return new Wallet(keypair);
+  }
+
+  /**
+   * Get wallet with custom account and change indexes
+   * Path: m/44'/501'/{account}'/{change}'
+   */
+  getWalletWithPath(account: number, change: number = 0): Wallet {
+    const path = `m/44'/501'/${account}'/${change}'`;
     const keypair = this.derivePath(path);
     return new Wallet(keypair);
   }
@@ -127,6 +177,14 @@ export class HDWallet {
     }
 
     return wallets;
+  }
+
+  /**
+   * Get the master public key (for watch-only wallets)
+   */
+  getMasterPublicKey(): PublicKey {
+    const keypair = Keypair.fromSeed(new Uint8Array(this.masterKey));
+    return keypair.publicKey;
   }
 }
 

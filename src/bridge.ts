@@ -193,21 +193,7 @@ export class BridgeClient extends EventEmitter {
   }
 
   /**
-   * Cancel a pending deposit (if supported)
-   */
-  async cancelDeposit(depositId: string): Promise<boolean> {
-    try {
-      // Implementation would call bridge cancel endpoint
-      this.stopMonitoring(depositId);
-      return true;
-    } catch (error) {
-      console.error('Failed to cancel deposit:', error);
-      return false;
-    }
-  }
-
-  /**
-   * Get bridge statistics
+   * Get bridge statistics from the RPC endpoint
    */
   async getStats(): Promise<{
     totalDeposits: number;
@@ -215,27 +201,63 @@ export class BridgeClient extends EventEmitter {
     totalVolume: number;
     activeRelayers: number;
   }> {
-    const metrics = await this.client.getMetrics();
-    return {
-      totalDeposits: 0, // Would be fetched from bridge metrics
-      totalWithdrawals: 0,
-      totalVolume: 0,
-      activeRelayers: 0,
-    };
+    try {
+      // Fetch bridge stats from RPC
+      const stats = await this.client.call<{
+        totalDeposits: number;
+        totalWithdrawals: number;
+        totalDepositVolume: number;
+        totalWithdrawalVolume: number;
+        activeRelayers: number;
+      }>('getBridgeStats', {});
+
+      return {
+        totalDeposits: stats.totalDeposits || 0,
+        totalWithdrawals: stats.totalWithdrawals || 0,
+        totalVolume: (stats.totalDepositVolume || 0) + (stats.totalWithdrawalVolume || 0),
+        activeRelayers: stats.activeRelayers || 0,
+      };
+    } catch (error) {
+      console.warn('Failed to fetch bridge stats from RPC:', error);
+      // Return cached or default values
+      return {
+        totalDeposits: 0,
+        totalWithdrawals: 0,
+        totalVolume: 0,
+        activeRelayers: 0,
+      };
+    }
   }
 
   /**
-   * Estimate bridge fee
+   * Estimate bridge fee by querying the RPC endpoint
    */
   async estimateFee(
     fromChain: string,
     toChain: string,
     amount: number
   ): Promise<number> {
-    // Fee calculation based on amount and chain
-    const baseFee = 1000;
-    const percentageFee = Math.floor(amount * 0.001); // 0.1%
-    return baseFee + percentageFee;
+    try {
+      // Query dynamic fee from RPC
+      const feeInfo = await this.client.call<{
+        baseFee: number;
+        percentageFee: number;
+        totalFee: number;
+        congestionFactor?: number;
+      }>('estimateBridgeFee', {
+        fromChain,
+        toChain,
+        amount,
+      });
+
+      return feeInfo.totalFee;
+    } catch (error) {
+      console.warn('Failed to estimate fee from RPC, using fallback:', error);
+      // Fallback calculation
+      const baseFee = 1000;
+      const percentageFee = Math.floor(amount * 0.001); // 0.1%
+      return baseFee + percentageFee;
+    }
   }
 
   /**
@@ -393,21 +415,111 @@ export class AdvancedBridgeClient extends BridgeClient {
   }
 
   /**
-   * Get transaction history for an address
+   * Get transaction history for an address from the RPC endpoint
    */
   async getHistory(
     address: string,
     limit: number = 50
   ): Promise<Array<DepositInfo | WithdrawalInfo>> {
-    // Would fetch from bridge API
-    return [];
+    try {
+      const result = await this.client.call<{
+        operations: Array<{
+          id: string;
+          type: 'deposit' | 'withdraw';
+          status: string;
+          amount: number;
+          fromChain: string;
+          toChain: string;
+          token: string;
+          sender: string;
+          recipient: string;
+          timestamp: number;
+          txHash?: string;
+          confirmations?: number;
+        }>;
+        total: number;
+      }>('getBridgeHistory', { address, limit });
+
+      return result.operations.map((op) => {
+        const status = op.status as BridgeStatus;
+        
+        if (op.type === 'deposit') {
+          return {
+            depositId: op.id,
+            fromChain: op.fromChain,
+            toChain: op.toChain,
+            amount: op.amount,
+            token: op.token,
+            sender: op.sender,
+            recipient: op.recipient,
+            status,
+            timestamp: op.timestamp,
+            confirmations: op.confirmations,
+            txHash: op.txHash,
+          } as DepositInfo;
+        } else {
+          return {
+            withdrawalId: op.id,
+            fromChain: op.fromChain,
+            toChain: op.toChain,
+            amount: op.amount,
+            token: op.token,
+            sender: op.sender,
+            recipient: op.recipient,
+            status,
+            timestamp: op.timestamp,
+            confirmations: op.confirmations,
+            txHash: op.txHash,
+          } as WithdrawalInfo;
+        }
+      });
+    } catch (error) {
+      console.warn('Failed to fetch bridge history:', error);
+      return [];
+    }
   }
 
   /**
-   * Retry failed operation
+   * Retry a failed operation
    */
-  async retryOperation(id: string, type: 'deposit' | 'withdraw'): Promise<void> {
-    // Implementation would call bridge retry endpoint
-    this.startMonitoring(id, type);
+  async retryOperation(id: string, type: 'deposit' | 'withdraw'): Promise<boolean> {
+    try {
+      const result = await this.client.call<{ success: boolean; signature?: string }>(
+        'retryBridgeOperation',
+        { operationId: id, type }
+      );
+
+      if (result.success) {
+        // Resume monitoring
+        this.startMonitoring(id, type);
+        return true;
+      }
+      return false;
+    } catch (error) {
+      console.error('Failed to retry operation:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Cancel a pending deposit by calling the RPC endpoint
+   */
+  async cancelDeposit(depositId: string): Promise<boolean> {
+    try {
+      const result = await this.client.call<{ success: boolean; refundTxHash?: string }>(
+        'cancelBridgeDeposit',
+        { depositId }
+      );
+
+      if (result.success) {
+        this.stopMonitoring(depositId);
+        this.emit('cancelled', { id: depositId, refundTxHash: result.refundTxHash });
+        return true;
+      }
+      return false;
+    } catch (error) {
+      console.error('Failed to cancel deposit:', error);
+      return false;
+    }
   }
 }
