@@ -75,6 +75,12 @@ pub struct Bridge {
     /// Relayer stakes for slashing calculations
     /// Maps relayer pubkey -> staked amount in lamports
     relayer_stakes: Arc<RwLock<HashMap<Vec<u8>, u64>>>,
+    /// Solana light client for Merkle proof verification
+    /// Initialized at startup for production use
+    light_client: Arc<crate::proof_verification::SolanaLightClient>,
+    /// Event bus for publishing bridge events to subscribers
+    /// Uses tokio broadcast channel for multi-consumer support
+    event_sender: tokio::sync::broadcast::Sender<BridgeEvent>,
 }
 
 /// Configuration for slashing parameters
@@ -246,7 +252,30 @@ pub enum BridgeEvent {
 }
 
 impl Bridge {
+    /// Create a new Bridge with production configuration
+    /// 
+    /// The light client is initialized at startup using the configured Solana RPC URL.
+    /// This ensures all Merkle proof verifications use a properly initialized client.
+    /// 
+    /// An event bus (tokio broadcast channel) is created for publishing bridge events
+    /// to multiple subscribers (RPC servers, indexers, monitoring systems).
     pub fn new(config: BridgeConfig) -> Self {
+        // Initialize light client at startup for production use
+        let light_client = Arc::new(crate::proof_verification::SolanaLightClient::new(
+            config.solana_rpc_url.clone(),
+            config.min_confirmations,
+        ));
+        
+        // Create event bus with capacity for 1000 pending events
+        // If subscribers fall behind, old events are dropped (lagged)
+        let (event_sender, _) = tokio::sync::broadcast::channel(1000);
+        
+        info!(
+            "Bridge initialized with Solana RPC: {}, min confirmations: {}",
+            config.solana_rpc_url,
+            config.min_confirmations
+        );
+        
         Self {
             config,
             deposits: Arc::new(RwLock::new(HashMap::new())),
@@ -255,7 +284,32 @@ impl Bridge {
             legacy_nonce: Arc::new(RwLock::new(0)),
             processed_proofs: Arc::new(RwLock::new(HashMap::new())),
             relayer_stakes: Arc::new(RwLock::new(HashMap::new())),
+            light_client,
+            event_sender,
         }
+    }
+    
+    /// Subscribe to bridge events
+    /// 
+    /// Returns a receiver that will receive all future bridge events.
+    /// Multiple subscribers are supported via broadcast semantics.
+    /// 
+    /// # Example
+    /// ```ignore
+    /// let mut receiver = bridge.subscribe_events();
+    /// tokio::spawn(async move {
+    ///     while let Ok(event) = receiver.recv().await {
+    ///         println!("Received event: {:?}", event);
+    ///     }
+    /// });
+    /// ```
+    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<BridgeEvent> {
+        self.event_sender.subscribe()
+    }
+    
+    /// Get the number of active event subscribers
+    pub fn subscriber_count(&self) -> usize {
+        self.event_sender.receiver_count()
     }
     
     /// Register a relayer with their staked amount
@@ -986,17 +1040,12 @@ impl Bridge {
         })
     }
     
-    /// Get or create light client for verification
+    /// Get the light client for verification
+    /// 
+    /// Returns the light client that was initialized at startup.
+    /// This ensures consistent configuration across all verifications.
     fn get_light_client(&self) -> Result<Arc<crate::proof_verification::SolanaLightClient>> {
-        // In production, this would be initialized at startup
-        // For now, create on demand with configured RPC URL
-        let rpc_url = std::env::var("SOLANA_RPC_URL")
-            .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
-        
-        Ok(Arc::new(crate::proof_verification::SolanaLightClient::new(
-            rpc_url,
-            32, // 32 confirmations for finality
-        )))
+        Ok(Arc::clone(&self.light_client))
     }
     
     /// Verify fraud evidence for invalid Merkle proof
@@ -1092,9 +1141,26 @@ impl Bridge {
         final_slash
     }
 
+    /// Emit a bridge event to all subscribers
+    /// 
+    /// Events are published to the broadcast channel and will be received
+    /// by all active subscribers. If no subscribers exist, the event is
+    /// logged but not queued (fire-and-forget semantics).
     fn emit_event(&self, event: BridgeEvent) {
-        // In production, this would publish to an event bus
-        info!("Bridge event: {:?}", event);
+        // Log the event for debugging/monitoring
+        debug!("Bridge event: {:?}", event);
+        
+        // Publish to event bus
+        match self.event_sender.send(event.clone()) {
+            Ok(subscriber_count) => {
+                debug!("Event delivered to {} subscribers", subscriber_count);
+            }
+            Err(_) => {
+                // No active subscribers - this is normal during startup
+                // or if no external systems are listening
+                debug!("No subscribers for bridge event");
+            }
+        }
     }
 
     pub fn get_stats(&self) -> BridgeStats {

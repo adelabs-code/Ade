@@ -207,19 +207,99 @@ impl Instruction {
         std::io::Read::read_exact(&mut cursor, &mut instruction_data)?;
         
         // Resolve accounts from indices using account_keys
+        // Default to conservative flags when header info not available
         let accounts = account_indices.iter().map(|&idx| {
             if idx < account_keys.len() {
                 AccountMeta {
                     pubkey: account_keys[idx].clone(),
-                    // NOTE: Signer/writable flags should come from message header
-                    // For now, we use a simple heuristic:
-                    // - Index 0 is typically the fee payer (signer + writable)
-                    // - Lower indices are more likely to be signers
+                    // Conservative defaults - use deserialize_with_header for accurate flags
                     is_signer: idx == 0,
-                    is_writable: idx < 2, // First two accounts are typically writable
+                    is_writable: idx < 2,
                 }
             } else {
-                // Fallback for out-of-bounds or no context
+                AccountMeta {
+                    pubkey: vec![0u8; 32],
+                    is_signer: false,
+                    is_writable: false,
+                }
+            }
+        }).collect();
+        
+        Ok(Self {
+            program_id,
+            accounts,
+            data: instruction_data,
+        })
+    }
+
+    /// Deserialize with message header information for accurate signer/writable flags
+    /// 
+    /// The message header contains:
+    /// - num_required_signatures: accounts[0..num_required_signatures] are signers
+    /// - num_readonly_signed_accounts: accounts[num_required_signatures - num_readonly_signed..num_required_signatures] are readonly
+    /// - num_readonly_unsigned_accounts: accounts[account_keys.len() - num_readonly_unsigned..] are readonly
+    pub fn deserialize_with_header(
+        data: &[u8],
+        account_keys: &[Vec<u8>],
+        num_required_signatures: u8,
+        num_readonly_signed_accounts: u8,
+        num_readonly_unsigned_accounts: u8,
+    ) -> Result<Self> {
+        let mut cursor = std::io::Cursor::new(data);
+        
+        // Read program ID index
+        let program_idx = cursor.read_u8()? as usize;
+        
+        // Read account indices
+        let num_accounts = Self::read_compact_u16(&mut cursor)? as usize;
+        let mut account_indices = Vec::with_capacity(num_accounts);
+        for _ in 0..num_accounts {
+            account_indices.push(cursor.read_u8()? as usize);
+        }
+        
+        // Read instruction data
+        let data_len = Self::read_compact_u16(&mut cursor)? as usize;
+        let mut instruction_data = vec![0u8; data_len];
+        std::io::Read::read_exact(&mut cursor, &mut instruction_data)?;
+        
+        // Resolve program ID
+        let program_id = if program_idx < account_keys.len() {
+            account_keys[program_idx].clone()
+        } else {
+            vec![0u8; 32]
+        };
+        
+        // Compute signer/writable boundaries
+        let num_signers = num_required_signatures as usize;
+        let num_readonly_signers = num_readonly_signed_accounts as usize;
+        let num_readonly_unsigned = num_readonly_unsigned_accounts as usize;
+        let total_accounts = account_keys.len();
+        
+        // Writable signed: accounts[0..num_signers - num_readonly_signers]
+        let writable_signed_end = num_signers.saturating_sub(num_readonly_signers);
+        // Readonly signed: accounts[writable_signed_end..num_signers]
+        // Writable unsigned: accounts[num_signers..total_accounts - num_readonly_unsigned]
+        let readonly_unsigned_start = total_accounts.saturating_sub(num_readonly_unsigned);
+        
+        // Resolve accounts with proper flags
+        let accounts = account_indices.iter().map(|&idx| {
+            if idx < account_keys.len() {
+                let is_signer = idx < num_signers;
+                
+                let is_writable = if idx < num_signers {
+                    // Signed accounts: writable if not in readonly section
+                    idx < writable_signed_end
+                } else {
+                    // Unsigned accounts: writable if not in readonly section
+                    idx < readonly_unsigned_start
+                };
+                
+                AccountMeta {
+                    pubkey: account_keys[idx].clone(),
+                    is_signer,
+                    is_writable,
+                }
+            } else {
                 AccountMeta {
                     pubkey: vec![0u8; 32],
                     is_signer: false,

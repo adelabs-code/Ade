@@ -10,6 +10,8 @@ crate-type = ["cdylib", "lib"]
 solana-program = "1.18"
 spl-token = "4.0"
 borsh = "0.10"
+ed25519-dalek = "1.0"
+bs58 = "0.5"
 
 [dev-dependencies]
 solana-program-test = "1.18"

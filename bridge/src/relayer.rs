@@ -617,7 +617,7 @@ async fn process_relay_task(
         task.source_chain, task.target_chain, task.retry_count + 1);
 
     let result = match (&task.source_chain.as_str(), &task.target_chain.as_str()) {
-        ("solana", "ade") => relay_to_ade(config, rpc_clients, &task).await,
+        ("solana", "ade") => relay_to_ade(config, rpc_clients, &task, relayer_keypair).await,
         ("ade", "solana") => relay_to_solana(config, rpc_clients, &task, relayer_keypair).await,
         _ => Err(anyhow::anyhow!("Unsupported chain pair")),
     };
@@ -661,8 +661,16 @@ async fn relay_to_ade(
     config: &RelayerConfig,
     rpc_clients: &RpcClients,
     task: &RelayTask,
+    relayer_keypair: Option<&ed25519_dalek::Keypair>,
 ) -> Result<()> {
     info!("Relaying deposit from Solana to Ade");
+
+    // Validate keypair is present
+    if relayer_keypair.is_none() {
+        return Err(anyhow::anyhow!(
+            "Relayer keypair required for signing proofs. Configure 'keypair_path' in RelayerConfig."
+        ));
+    }
 
     // 1. Generate proof with actual Merkle path from Solana
     // This fetches real state proofs from Solana RPC
@@ -670,7 +678,7 @@ async fn relay_to_ade(
         &rpc_clients.solana,
         &config.solana_rpc_url,
         task,
-        None, // TODO: Pass actual relayer keypair from config
+        relayer_keypair,
     ).await?;
 
     // 2. Submit proof to Ade sidechain

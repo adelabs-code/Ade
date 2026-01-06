@@ -59,6 +59,14 @@ struct BlockSnapshot {
     pub parent_hash: Vec<u8>,
 }
 
+/// Block metadata for storage
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockMetadata {
+    pub slot: u64,
+    pub hash: Vec<u8>,
+    pub parent_hash: Vec<u8>,
+}
+
 impl SnapshotManager {
     pub fn new(snapshot_dir: impl AsRef<Path>, snapshot_interval_slots: u64) -> Result<Self> {
         let snapshot_dir = snapshot_dir.as_ref().to_path_buf();
@@ -244,16 +252,30 @@ impl SnapshotManager {
             restored_accounts += 1;
         }
 
-        // Restore blocks
+        // Restore blocks to storage
+        // Block data includes: slot -> (hash, parent_hash)
+        // This allows the node to know the chain structure up to the snapshot point
         let mut restored_blocks = 0;
         for block in &snapshot_data.blocks {
-            // In production, would reconstruct full block data
-            // For now, we have the framework
+            // Store block metadata (slot -> block info mapping)
+            let block_key = format!("block:{}", block.slot);
+            let block_data = bincode::serialize(&BlockMetadata {
+                slot: block.slot,
+                hash: block.hash.clone(),
+                parent_hash: block.parent_hash.clone(),
+            })?;
+            storage.put(block_key.as_bytes(), &block_data)?;
+            
+            // Also store hash -> slot mapping for reverse lookup
+            let hash_key = format!("blockhash:{}", bs58::encode(&block.hash).into_string());
+            storage.put(hash_key.as_bytes(), &block.slot.to_le_bytes())?;
+            
             restored_blocks += 1;
         }
 
         info!("Restored {} accounts and {} blocks from snapshot", 
             restored_accounts, restored_blocks);
+        info!("Snapshot restoration complete. Chain state at slot {}", slot);
 
         Ok(())
     }

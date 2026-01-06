@@ -206,27 +206,74 @@ impl BlockProducer {
     }
 
     /// Extract priority fees from transactions
+    /// 
+    /// Parses ComputeBudget program instructions to extract priority fees.
+    /// 
+    /// ComputeBudget instruction discriminators:
+    /// - 0: RequestUnitsDeprecated (legacy)
+    /// - 1: RequestHeapFrame
+    /// - 2: SetComputeUnitLimit (4 bytes)
+    /// - 3: SetComputeUnitPrice (8 bytes) - this is what we want
     fn extract_priority_fees(&self, transactions: &[Transaction]) -> Vec<u64> {
+        // ComputeBudget program ID (11111111111111111111111111111112)
+        const COMPUTE_BUDGET_PROGRAM_ID: [u8; 32] = [
+            3, 6, 70, 111, 229, 33, 23, 50, 255, 236, 173, 186, 114, 195, 155, 231,
+            188, 140, 229, 187, 197, 247, 18, 107, 44, 67, 155, 58, 64, 0, 0, 0
+        ];
+        
+        // SetComputeUnitPrice discriminator
+        const SET_COMPUTE_UNIT_PRICE: u8 = 3;
+        
         transactions.iter()
-            .filter_map(|tx| {
-                // In production, parse ComputeBudget instructions for priority fees
-                // For now, extract from transaction structure
+            .map(|tx| {
+                let mut priority_fee = 0u64;
+                let mut compute_units = 200_000u32; // Default compute units
                 
-                // Check if transaction has compute budget instructions
                 for instruction in &tx.message.instructions {
-                    if instruction.data.len() >= 9 {
-                        // Check discriminator for SetComputeUnitPrice (0x01)
-                        if instruction.data[0] == 1 {
-                            // Extract priority fee (8 bytes after discriminator)
+                    // Check if this is a ComputeBudget instruction
+                    let is_compute_budget = instruction.program_id.len() == 32 
+                        && instruction.program_id == COMPUTE_BUDGET_PROGRAM_ID;
+                    
+                    if !is_compute_budget {
+                        continue;
+                    }
+                    
+                    if instruction.data.is_empty() {
+                        continue;
+                    }
+                    
+                    match instruction.data[0] {
+                        // SetComputeUnitPrice (discriminator: 3, data: 8 bytes u64)
+                        3 if instruction.data.len() >= 9 => {
                             if let Ok(bytes) = instruction.data[1..9].try_into() {
-                                return Some(u64::from_le_bytes(bytes));
+                                priority_fee = u64::from_le_bytes(bytes);
                             }
                         }
+                        // SetComputeUnitLimit (discriminator: 2, data: 4 bytes u32)
+                        2 if instruction.data.len() >= 5 => {
+                            if let Ok(bytes) = instruction.data[1..5].try_into() {
+                                compute_units = u32::from_le_bytes(bytes);
+                            }
+                        }
+                        // RequestUnitsDeprecated (discriminator: 0, legacy format)
+                        0 if instruction.data.len() >= 9 => {
+                            // Legacy: units (4 bytes) + additional_fee (4 bytes)
+                            if let Ok(units_bytes) = instruction.data[1..5].try_into() {
+                                compute_units = u32::from_le_bytes(units_bytes);
+                            }
+                            if let Ok(fee_bytes) = instruction.data[5..9].try_into() {
+                                // Legacy fee format - convert to micro-lamports per CU
+                                let legacy_fee = u32::from_le_bytes(fee_bytes) as u64;
+                                priority_fee = legacy_fee * 1_000_000 / compute_units.max(1) as u64;
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 
-                // Default priority fee
-                Some(0)
+                // Calculate total priority fee: micro-lamports per CU * CUs / 1M
+                // priority_fee is in micro-lamports per compute unit
+                (priority_fee * compute_units as u64) / 1_000_000
             })
             .collect()
     }

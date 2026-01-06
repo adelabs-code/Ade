@@ -256,9 +256,16 @@ fn process_lock(
     bridge_state.nonce += 1;
     bridge_state.serialize(&mut &mut bridge_state_account.data.borrow_mut()[..])?;
 
-    // Get token mint from the depositor's token account for event
-    // In production, this would be read from the token account data
-    let token_mint = *depositor_token_account.key; // Simplified
+    // Read token mint from the token account data (SPL Token account layout)
+    // SPL Token Account layout: mint (32) + owner (32) + amount (8) + ...
+    let token_account_data = depositor_token_account.try_borrow_data()?;
+    if token_account_data.len() < 32 {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let token_mint = Pubkey::new_from_array(
+        token_account_data[0..32].try_into()
+            .map_err(|_| ProgramError::InvalidAccountData)?
+    );
 
     // Emit deposit event with all required information for relayers
     let deposit_event = DepositEvent {
@@ -429,20 +436,46 @@ fn verify_bridge_proof_full(proof: &BridgeProof, bridge_state: &BridgeState) -> 
     message.extend_from_slice(&proof.event_data);
     let message_hash = solana_program::keccak::hash(&message);
     
+    // Collect valid signatures for threshold check
+    let mut valid_signature_count = 0;
+    
     for sig in &proof.relayer_signatures {
         if sig.signature.len() != 64 || sig.relayer_pubkey.len() != 32 {
             msg!("Invalid signature or pubkey length");
             return Err(ProgramError::InvalidArgument);
         }
         
-        // Use Solana's Ed25519 verification via syscall
-        // Note: In production, this would use ed25519_verify or precompile
-        // For now, we verify the signature structure is valid
-        let sig_valid = sig.signature.iter().any(|b| *b != 0);
-        if !sig_valid {
-            msg!("Invalid signature from relayer");
-            return Err(ProgramError::InvalidArgument);
+        // Verify Ed25519 signature using Solana's native verification
+        // This uses the Ed25519 program (precompile) under the hood
+        let signature_bytes: [u8; 64] = sig.signature.as_slice()
+            .try_into()
+            .map_err(|_| ProgramError::InvalidArgument)?;
+        let pubkey_bytes: [u8; 32] = sig.relayer_pubkey.as_slice()
+            .try_into()
+            .map_err(|_| ProgramError::InvalidArgument)?;
+        
+        // Construct Ed25519 instruction data for verification
+        // Format: num_sigs (1) + padding (1) + offsets (14) + signature (64) + pubkey (32) + message
+        let sig_valid = verify_ed25519_signature(
+            &signature_bytes,
+            &pubkey_bytes,
+            message_hash.as_ref(),
+        );
+        
+        if sig_valid {
+            valid_signature_count += 1;
+            msg!("Valid signature from relayer: {}", 
+                bs58::encode(&sig.relayer_pubkey).into_string());
+        } else {
+            msg!("Invalid signature from relayer: {}",
+                bs58::encode(&sig.relayer_pubkey).into_string());
         }
+    }
+    
+    // Check threshold
+    if valid_signature_count < MIN_SIGNATURES {
+        msg!("Not enough valid signatures: {} < {}", valid_signature_count, MIN_SIGNATURES);
+        return Err(ProgramError::InvalidArgument);
     }
 
     // 3. Verify merkle proof against trusted root
@@ -553,6 +586,49 @@ pub fn add_trusted_root(
     }
     
     bridge_state.trusted_roots.push(new_root);
+}
+
+/// Verify Ed25519 signature using Solana's native verification
+/// 
+/// This uses the Ed25519 signature verification algorithm directly.
+/// In Solana programs, for cross-program verification, use the Ed25519 precompile.
+/// 
+/// # Security
+/// - Signature must be 64 bytes
+/// - Public key must be 32 bytes
+/// - Message should be hashed for consistency
+fn verify_ed25519_signature(
+    signature: &[u8; 64],
+    pubkey: &[u8; 32],
+    message: &[u8],
+) -> bool {
+    // Use ed25519-dalek for verification
+    // This is the same library used by Solana's Ed25519 program
+    use ed25519_dalek::{PublicKey, Signature, Verifier};
+    
+    // Parse public key
+    let public_key = match PublicKey::from_bytes(pubkey) {
+        Ok(pk) => pk,
+        Err(_) => {
+            msg!("Invalid public key format");
+            return false;
+        }
+    };
+    
+    // Parse signature
+    let sig = match Signature::from_bytes(signature) {
+        Ok(s) => s,
+        Err(_) => {
+            msg!("Invalid signature format");
+            return false;
+        }
+    };
+    
+    // Verify signature
+    match public_key.verify(message, &sig) {
+        Ok(()) => true,
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]
