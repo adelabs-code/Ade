@@ -1,5 +1,6 @@
-use std::collections::{HashMap, BTreeMap};
+use std::collections::{HashMap, BTreeMap, HashSet, BinaryHeap};
 use std::sync::{Arc, RwLock};
+use std::cmp::Ordering;
 use anyhow::{Result, Context};
 use serde::{Serialize, Deserialize};
 use tracing::{info, debug, warn};
@@ -9,15 +10,50 @@ use crate::utils::{current_timestamp, to_base58};
 use crate::errors::{MempoolError, MempoolResult};
 use crate::storage::Storage;
 
+/// Priority entry for efficient heap-based ordering
+/// Uses (fee, timestamp) for stable ordering (same fee = older first)
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct PriorityEntry {
+    fee: u64,
+    timestamp: u64,
+    signature: Vec<u8>,
+}
+
+impl Ord for PriorityEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Higher fee = higher priority
+        // Same fee = older timestamp (lower value) = higher priority
+        match self.fee.cmp(&other.fee) {
+            Ordering::Equal => other.timestamp.cmp(&self.timestamp), // Older first
+            ord => ord,
+        }
+    }
+}
+
+impl PartialOrd for PriorityEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// Transaction mempool with priority ordering and DDoS protection
 ///
 /// The mempool stores pending transactions and orders them by fee priority.
 /// It enforces limits on capacity, per-account transactions, and validates
 /// sender balance and nonce to prevent DDoS attacks with invalid transactions.
+///
+/// OPTIMIZED: Uses a binary heap for O(log n) insertions/removals instead of
+/// BTreeMap with Vec which had O(n) removal in the worst case.
 pub struct Mempool {
     /// Transactions indexed by signature
     transactions: Arc<RwLock<HashMap<Vec<u8>, MempoolTransaction>>>,
-    /// Priority queue ordered by fee
+    /// Priority queue using binary heap for efficient ordering
+    /// O(log n) for push/pop vs O(n) for Vec::retain
+    priority_heap: Arc<RwLock<BinaryHeap<PriorityEntry>>>,
+    /// Set of removed signatures for lazy deletion
+    /// Entries in heap are skipped if signature is in this set
+    removed_signatures: Arc<RwLock<HashSet<Vec<u8>>>>,
+    /// Legacy priority queue (kept for compatibility, will be deprecated)
     priority_queue: Arc<RwLock<BTreeMap<u64, Vec<Vec<u8>>>>>,
     /// Transactions by sender for nonce tracking
     by_sender: Arc<RwLock<HashMap<Vec<u8>, Vec<Vec<u8>>>>>,
@@ -105,6 +141,8 @@ impl Mempool {
     pub fn new(config: MempoolConfig) -> Self {
         Self {
             transactions: Arc::new(RwLock::new(HashMap::new())),
+            priority_heap: Arc::new(RwLock::new(BinaryHeap::new())),
+            removed_signatures: Arc::new(RwLock::new(HashSet::new())),
             priority_queue: Arc::new(RwLock::new(BTreeMap::new())),
             by_sender: Arc::new(RwLock::new(HashMap::new())),
             sender_nonces: Arc::new(RwLock::new(HashMap::new())),
@@ -119,6 +157,8 @@ impl Mempool {
     pub fn with_storage(config: MempoolConfig, storage: Arc<Storage>) -> Self {
         Self {
             transactions: Arc::new(RwLock::new(HashMap::new())),
+            priority_heap: Arc::new(RwLock::new(BinaryHeap::new())),
+            removed_signatures: Arc::new(RwLock::new(HashSet::new())),
             priority_queue: Arc::new(RwLock::new(BTreeMap::new())),
             by_sender: Arc::new(RwLock::new(HashMap::new())),
             sender_nonces: Arc::new(RwLock::new(HashMap::new())),
@@ -127,6 +167,71 @@ impl Mempool {
             storage: Some(storage),
             balance_cache: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+    
+    /// Get highest priority transactions efficiently using heap
+    /// 
+    /// This is O(k log n) where k is the number of transactions requested.
+    /// Uses lazy deletion - entries marked as removed are skipped.
+    pub fn get_highest_priority_fast(&self, count: usize) -> Vec<MempoolTransaction> {
+        let txs = self.transactions.read().unwrap();
+        let mut heap = self.priority_heap.write().unwrap();
+        let removed = self.removed_signatures.read().unwrap();
+        
+        let mut result = Vec::with_capacity(count);
+        let mut to_reinsert = Vec::new();
+        
+        while result.len() < count {
+            match heap.pop() {
+                Some(entry) => {
+                    // Skip if this entry was marked as removed (lazy deletion)
+                    if removed.contains(&entry.signature) {
+                        continue;
+                    }
+                    
+                    // Get the actual transaction
+                    if let Some(mtx) = txs.get(&entry.signature) {
+                        result.push(mtx.clone());
+                        to_reinsert.push(entry);
+                    }
+                    // If not in transactions map, it was removed - skip
+                }
+                None => break,
+            }
+        }
+        
+        // Reinsert popped entries (we're just peeking)
+        for entry in to_reinsert {
+            heap.push(entry);
+        }
+        
+        result
+    }
+    
+    /// Compact the heap by removing marked-as-deleted entries
+    /// Call this periodically to prevent heap bloat
+    pub fn compact_priority_heap(&self) {
+        let removed = self.removed_signatures.read().unwrap();
+        if removed.len() < 1000 {
+            return; // Only compact if many deletions pending
+        }
+        
+        let mut heap = self.priority_heap.write().unwrap();
+        let mut new_heap = BinaryHeap::with_capacity(heap.len() - removed.len());
+        
+        for entry in heap.drain() {
+            if !removed.contains(&entry.signature) {
+                new_heap.push(entry);
+            }
+        }
+        
+        *heap = new_heap;
+        
+        // Clear removed set after compaction
+        drop(removed);
+        self.removed_signatures.write().unwrap().clear();
+        
+        debug!("Compacted priority heap, removed {} stale entries", removed.len());
     }
 
     /// Add transaction to mempool with full validation
@@ -242,9 +347,19 @@ impl Mempool {
             txs.insert(signature.clone(), mempool_tx);
         }
 
-        // Add to priority queue
+        // Add to priority queue (legacy) and new heap
         {
             let total_fee = fee + priority_fee;
+            
+            // Add to new heap (O(log n))
+            let mut heap = self.priority_heap.write().unwrap();
+            heap.push(PriorityEntry {
+                fee: total_fee,
+                timestamp: mempool_tx.received_at,
+                signature: signature.clone(),
+            });
+            
+            // Also add to legacy BTreeMap for backward compatibility
             let mut queue = self.priority_queue.write().unwrap();
             queue.entry(total_fee)
                 .or_insert_with(Vec::new)
@@ -403,6 +518,19 @@ impl Mempool {
         };
 
         if let Some(ref tx) = removed {
+            // Mark as removed in the new heap (lazy deletion - O(1))
+            {
+                let mut removed_set = self.removed_signatures.write().unwrap();
+                removed_set.insert(signature.to_vec());
+                
+                // Compact if too many removals pending
+                if removed_set.len() > 5000 {
+                    drop(removed_set);
+                    self.compact_priority_heap();
+                }
+            }
+            
+            // Remove from legacy priority queue (O(n) - to be deprecated)
             {
                 let total_fee = tx.fee + tx.priority_fee;
                 let mut queue = self.priority_queue.write().unwrap();
@@ -546,6 +674,8 @@ impl Mempool {
     /// Clear all transactions from mempool
     pub fn clear(&self) {
         self.transactions.write().unwrap().clear();
+        self.priority_heap.write().unwrap().clear();
+        self.removed_signatures.write().unwrap().clear();
         self.priority_queue.write().unwrap().clear();
         self.by_sender.write().unwrap().clear();
     }
