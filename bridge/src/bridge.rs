@@ -28,6 +28,20 @@ pub struct Bridge {
     withdrawals: Arc<RwLock<HashMap<Vec<u8>, WithdrawalInfo>>>,
     nonce: Arc<RwLock<u64>>,
     processed_proofs: Arc<RwLock<HashMap<Vec<u8>, bool>>>,
+    /// Relayer stakes for slashing calculations
+    /// Maps relayer pubkey -> staked amount in lamports
+    relayer_stakes: Arc<RwLock<HashMap<Vec<u8>, u64>>>,
+}
+
+/// Configuration for slashing parameters
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlashingConfig {
+    /// Percentage of stake to slash (e.g., 1000 = 10%, 10000 = 100%)
+    pub slash_percentage_bps: u64,
+    /// Minimum slash amount in lamports
+    pub min_slash_amount: u64,
+    /// Maximum slash amount in lamports
+    pub max_slash_amount: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -195,7 +209,37 @@ impl Bridge {
             withdrawals: Arc::new(RwLock::new(HashMap::new())),
             nonce: Arc::new(RwLock::new(0)),
             processed_proofs: Arc::new(RwLock::new(HashMap::new())),
+            relayer_stakes: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+    
+    /// Register a relayer with their staked amount
+    pub fn register_relayer_stake(&self, relayer_pubkey: Vec<u8>, stake_amount: u64) -> Result<()> {
+        let mut stakes = self.relayer_stakes.write().unwrap();
+        stakes.insert(relayer_pubkey.clone(), stake_amount);
+        info!("Registered relayer stake: {} lamports for {}", 
+            stake_amount, bs58::encode(&relayer_pubkey).into_string());
+        Ok(())
+    }
+    
+    /// Update a relayer's stake amount
+    pub fn update_relayer_stake(&self, relayer_pubkey: &[u8], new_stake: u64) -> Result<()> {
+        let mut stakes = self.relayer_stakes.write().unwrap();
+        if stakes.contains_key(relayer_pubkey) {
+            stakes.insert(relayer_pubkey.to_vec(), new_stake);
+            info!("Updated relayer stake: {} lamports", new_stake);
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Relayer not registered"))
+        }
+    }
+    
+    /// Get a relayer's current stake
+    pub fn get_relayer_stake(&self, relayer_pubkey: &[u8]) -> u64 {
+        self.relayer_stakes.read().unwrap()
+            .get(relayer_pubkey)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn initiate_deposit(
@@ -778,18 +822,77 @@ impl Bridge {
     }
     
     /// Verify fraud evidence for state mismatch
+    /// 
+    /// SECURITY CRITICAL: This function now verifies that the claimed "actual_root"
+    /// in the fraud evidence is actually present in a verified block header from
+    /// the light client. Without this check, attackers could forge fraud proofs
+    /// to slash honest relayers.
     fn verify_state_mismatch_fraud(&self, evidence: &FraudEvidence) -> Result<FraudVerificationResult> {
-        // Verify that the claimed state doesn't match the actual source chain state
-        // This requires verifying the Merkle proof against the claimed root
+        use crate::proof_verification::SolanaLightClient;
         
+        // Deserialize the original proof
         let original_proof: BridgeProof = bincode::deserialize(&evidence.original_proof_data)
             .context("Failed to deserialize original proof")?;
         
-        // Verify the Merkle proof with the conflicting data as the expected root
+        // Get the claimed root from the original proof
         let claimed_root = &original_proof.merkle_proof.last().cloned().unwrap_or_default();
-        let actual_root = &evidence.conflicting_data;
+        let submitted_actual_root = &evidence.conflicting_data;
         
-        if claimed_root != actual_root && !actual_root.is_empty() {
+        if submitted_actual_root.is_empty() {
+            return Ok(FraudVerificationResult {
+                is_valid: false,
+                responsible_party: None,
+                slash_amount: 0,
+                rejection_reason: "Fraud evidence contains empty conflicting data".to_string(),
+            });
+        }
+        
+        // CRITICAL: Verify that submitted_actual_root is from a verified block
+        // This prevents attackers from submitting fake "actual" roots
+        let light_client = self.get_light_client()?;
+        
+        // Get the verified header for the block in question
+        let verified_header = light_client.get_verified_header(original_proof.block_number)
+            .ok_or_else(|| anyhow::anyhow!(
+                "Cannot verify fraud proof: block {} not verified by light client. \
+                Wait for block to be finalized or fetch header first.",
+                original_proof.block_number
+            ))?;
+        
+        // The submitted_actual_root must match either state_root or transactions_root
+        // from the verified header to be considered legitimate
+        let is_root_in_header = 
+            submitted_actual_root == &verified_header.state_root ||
+            submitted_actual_root == &verified_header.transactions_root;
+        
+        if !is_root_in_header {
+            // The fraud submitter provided a fake "actual" root
+            warn!(
+                "Fraud proof rejected: submitted actual_root {} is not in verified header for block {}",
+                bs58::encode(submitted_actual_root).into_string(),
+                original_proof.block_number
+            );
+            return Ok(FraudVerificationResult {
+                is_valid: false,
+                responsible_party: None,
+                slash_amount: 0,
+                rejection_reason: format!(
+                    "Submitted actual_root is not verified by light client for block {}. \
+                    Fraud evidence may be forged.",
+                    original_proof.block_number
+                ),
+            });
+        }
+        
+        // Now we know submitted_actual_root is legitimate (from verified header)
+        // Check if it differs from what the relayer claimed
+        if claimed_root != submitted_actual_root {
+            info!(
+                "Valid fraud proof: relayer claimed root {} but verified root is {}",
+                bs58::encode(claimed_root).into_string(),
+                bs58::encode(submitted_actual_root).into_string()
+            );
+            
             return Ok(FraudVerificationResult {
                 is_valid: true,
                 responsible_party: original_proof.relayer_signatures.first()
@@ -807,8 +910,21 @@ impl Bridge {
             is_valid: false,
             responsible_party: None,
             slash_amount: 0,
-            rejection_reason: "State appears to match".to_string(),
+            rejection_reason: "State roots match - no fraud detected".to_string(),
         })
+    }
+    
+    /// Get or create light client for verification
+    fn get_light_client(&self) -> Result<Arc<crate::proof_verification::SolanaLightClient>> {
+        // In production, this would be initialized at startup
+        // For now, create on demand with configured RPC URL
+        let rpc_url = std::env::var("SOLANA_RPC_URL")
+            .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
+        
+        Ok(Arc::new(crate::proof_verification::SolanaLightClient::new(
+            rpc_url,
+            32, // 32 confirmations for finality
+        )))
     }
     
     /// Verify fraud evidence for invalid Merkle proof
@@ -863,10 +979,45 @@ impl Bridge {
     }
     
     /// Calculate slash amount for a relayer
+    /// Calculate the slash amount for a malicious relayer based on their actual stake
+    /// 
+    /// Slashing parameters:
+    /// - 10% of stake for fraud (1000 basis points)
+    /// - Minimum slash: 1 SOL (1_000_000_000 lamports)
+    /// - Maximum slash: 100 SOL (100_000_000_000 lamports)
     fn calculate_slash_amount(&self, relayer_pubkey: &[u8]) -> u64 {
-        // In production: look up relayer's stake and calculate 10% slash
-        // For now, return a fixed amount
-        10_000_000 // 10 SOL equivalent
+        const SLASH_PERCENTAGE_BPS: u64 = 1000; // 10% in basis points
+        const MIN_SLASH_LAMPORTS: u64 = 1_000_000_000; // 1 SOL
+        const MAX_SLASH_LAMPORTS: u64 = 100_000_000_000; // 100 SOL
+        
+        // Look up the relayer's actual stake
+        let relayer_stake = self.get_relayer_stake(relayer_pubkey);
+        
+        if relayer_stake == 0 {
+            warn!(
+                "Relayer {} has no registered stake, using minimum slash amount",
+                bs58::encode(relayer_pubkey).into_string()
+            );
+            return MIN_SLASH_LAMPORTS;
+        }
+        
+        // Calculate 10% of stake
+        let calculated_slash = (relayer_stake * SLASH_PERCENTAGE_BPS) / 10_000;
+        
+        // Apply min/max bounds
+        let final_slash = calculated_slash
+            .max(MIN_SLASH_LAMPORTS)
+            .min(MAX_SLASH_LAMPORTS);
+        
+        info!(
+            "Calculated slash for relayer {}: {} lamports ({:.2}% of {} stake)",
+            bs58::encode(relayer_pubkey).into_string(),
+            final_slash,
+            (final_slash as f64 / relayer_stake as f64) * 100.0,
+            relayer_stake
+        );
+        
+        final_slash
     }
 
     fn emit_event(&self, event: BridgeEvent) {
