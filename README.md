@@ -278,3 +278,4 @@ Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for gu
 ## Contact
 
 - Twitter: [@Ade__labs](https://twitter.com/Ade__labs)
+- Donation: `92XwFhgXfxCS2rmRK4EXchGMyW2EqFsNV5zoqWNpw3nS`
