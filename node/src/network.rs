@@ -3,9 +3,101 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use serde::{Serialize, Deserialize};
 use tracing::{info, debug, warn};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::{Duration, Instant};
 
 use crate::utils::{current_timestamp, hash_data};
+
+/// Time-based message cache entry with TTL support
+/// This prevents broadcast storms when cache is cleared
+#[derive(Debug, Clone)]
+struct MessageCacheEntry {
+    /// Message hash
+    hash: Vec<u8>,
+    /// When this entry was added
+    inserted_at: Instant,
+}
+
+/// TTL-based message cache for preventing broadcast storms
+/// 
+/// Unlike a simple HashSet with clear(), this cache:
+/// 1. Removes entries based on TTL (time-to-live)
+/// 2. Uses FIFO eviction when at capacity
+/// 3. Never clears entirely, preventing duplicate message processing
+struct TimeCache {
+    /// Message hashes indexed by insertion time
+    entries: VecDeque<MessageCacheEntry>,
+    /// Fast lookup set
+    lookup: HashSet<Vec<u8>>,
+    /// Maximum number of entries
+    max_size: usize,
+    /// TTL for each entry
+    ttl: Duration,
+}
+
+impl TimeCache {
+    fn new(max_size: usize, ttl: Duration) -> Self {
+        Self {
+            entries: VecDeque::with_capacity(max_size),
+            lookup: HashSet::with_capacity(max_size),
+            max_size,
+            ttl,
+        }
+    }
+    
+    /// Check if message is in cache (also prunes expired entries)
+    fn contains(&mut self, hash: &[u8]) -> bool {
+        self.prune_expired();
+        self.lookup.contains(hash)
+    }
+    
+    /// Insert a message hash into the cache
+    fn insert(&mut self, hash: Vec<u8>) -> bool {
+        self.prune_expired();
+        
+        // Already exists
+        if self.lookup.contains(&hash) {
+            return false;
+        }
+        
+        // At capacity - remove oldest (FIFO eviction)
+        while self.entries.len() >= self.max_size {
+            if let Some(oldest) = self.entries.pop_front() {
+                self.lookup.remove(&oldest.hash);
+            }
+        }
+        
+        // Insert new entry
+        self.lookup.insert(hash.clone());
+        self.entries.push_back(MessageCacheEntry {
+            hash,
+            inserted_at: Instant::now(),
+        });
+        
+        true
+    }
+    
+    /// Remove entries older than TTL
+    fn prune_expired(&mut self) {
+        let now = Instant::now();
+        
+        while let Some(front) = self.entries.front() {
+            if now.duration_since(front.inserted_at) > self.ttl {
+                if let Some(expired) = self.entries.pop_front() {
+                    self.lookup.remove(&expired.hash);
+                }
+            } else {
+                // Entries are ordered by time, so we can stop here
+                break;
+            }
+        }
+    }
+    
+    /// Get cache statistics
+    fn stats(&self) -> (usize, usize) {
+        (self.entries.len(), self.max_size)
+    }
+}
 
 /// Protocol version for handshake compatibility
 const PROTOCOL_VERSION: &str = "1.0.0";
@@ -77,7 +169,9 @@ pub struct NetworkManager {
     gossip_port: u16,
     bootstrap_nodes: Vec<String>,
     peers: Arc<RwLock<HashMap<Vec<u8>, PeerInfo>>>,
-    message_cache: Arc<RwLock<HashSet<Vec<u8>>>>,
+    /// TTL-based message cache - prevents broadcast storms
+    /// Unlike HashSet with clear(), this uses FIFO eviction and TTL
+    message_cache: Arc<tokio::sync::Mutex<TimeCache>>,
     max_peers: usize,
     /// Node's Ed25519 keypair for identity
     node_keypair: ed25519_dalek::Keypair,
@@ -146,11 +240,16 @@ impl NetworkManager {
         // Default genesis hash (should be loaded from config in production)
         let genesis_hash = Self::compute_default_genesis_hash();
         
+        // Message cache with 5 minute TTL and 50K max entries
+        // TTL ensures old messages are eventually forgotten
+        // FIFO eviction prevents full cache clear (which causes broadcast storms)
+        let message_cache = TimeCache::new(50_000, Duration::from_secs(300));
+        
         Ok(Self {
             gossip_port,
             bootstrap_nodes,
             peers: Arc::new(RwLock::new(HashMap::new())),
-            message_cache: Arc::new(RwLock::new(HashSet::new())),
+            message_cache: Arc::new(tokio::sync::Mutex::new(message_cache)),
             max_peers: 1000,
             node_keypair,
             genesis_hash,
@@ -189,11 +288,14 @@ impl NetworkManager {
         info!("Node identity initialized: {}", 
             bs58::encode(node_keypair.public.as_bytes()).into_string());
         
+        // Message cache with 5 minute TTL and 50K max entries
+        let message_cache = TimeCache::new(50_000, Duration::from_secs(300));
+        
         Ok(Self {
             gossip_port,
             bootstrap_nodes,
             peers: Arc::new(RwLock::new(HashMap::new())),
-            message_cache: Arc::new(RwLock::new(HashSet::new())),
+            message_cache: Arc::new(tokio::sync::Mutex::new(message_cache)),
             max_peers: 1000,
             node_keypair,
             genesis_hash,
@@ -496,18 +598,24 @@ impl NetworkManager {
     pub async fn broadcast(&self, message: GossipMessage) -> Result<usize> {
         let message_hash = hash_message(&message);
         
-        // Check if we've already seen this message
+        // Check if we've already seen this message using TTL-based cache
+        // This prevents broadcast storms that would occur with cache.clear()
         {
-            let mut cache = self.message_cache.write().await;
+            let mut cache = self.message_cache.lock().await;
+            
+            // TimeCache handles TTL expiration and FIFO eviction internally
             if cache.contains(&message_hash) {
                 debug!("Dropping duplicate message: already seen");
                 return Ok(0);
             }
+            
+            // Insert into cache - old entries are evicted by TTL/FIFO, never cleared
             cache.insert(message_hash.clone());
             
-            // Prune old messages (simple approach - in production use TTL-based eviction)
-            if cache.len() > 10000 {
-                cache.clear();
+            // Log cache stats periodically for monitoring
+            let (current, max) = cache.stats();
+            if current % 1000 == 0 {
+                debug!("Message cache: {}/{} entries", current, max);
             }
         }
 

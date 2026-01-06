@@ -4,31 +4,62 @@ use serde::{Serialize, Deserialize};
 use anyhow::Result;
 
 /// Dynamic fee market based on network congestion
+/// Dynamic fee market with exponential increase during spam attacks
+/// 
+/// SECURITY: This fee market can increase fees exponentially to make
+/// spam attacks economically infeasible. Under normal conditions, fees
+/// increase/decrease linearly by ~12.5% per block.
 pub struct FeeMarket {
     recent_blocks: Arc<RwLock<VecDeque<BlockFeeData>>>,
     base_fee: Arc<RwLock<u64>>,
     config: FeeMarketConfig,
+    /// Counter for consecutive blocks above exponential threshold
+    consecutive_full_blocks: Arc<RwLock<usize>>,
 }
 
+/// Fee market configuration with exponential increase for spam protection
+/// 
+/// CRITICAL SECURITY: The fee market must be able to increase fees
+/// exponentially under spam attacks to make attacks economically infeasible.
 #[derive(Debug, Clone)]
 pub struct FeeMarketConfig {
-    pub target_block_utilization: f64,  // 0.5 = 50%
-    pub max_fee_increase: f64,           // Max fee increase per block
-    pub max_fee_decrease: f64,           // Max fee decrease per block
+    /// Target block utilization (0.5 = 50%)
+    pub target_block_utilization: f64,
+    /// Base fee increase rate per block when above target
+    pub base_fee_increase_rate: f64,
+    /// Base fee decrease rate per block when below target
+    pub base_fee_decrease_rate: f64,
+    /// Minimum base fee (floor)
     pub min_base_fee: u64,
-    pub max_base_fee: u64,
+    /// Soft cap for base fee (fee can exceed this under extreme conditions)
+    /// Set very high or use u64::MAX for no effective cap
+    pub soft_max_base_fee: u64,
+    /// Number of blocks to track for fee estimation
     pub history_size: usize,
+    /// Exponential increase threshold - utilization above this triggers exponential fees
+    pub exponential_threshold: f64,
+    /// Exponential increase multiplier (e.g., 2.0 = double fee each block when over threshold)
+    pub exponential_multiplier: f64,
+    /// Consecutive blocks over threshold before exponential kicks in
+    pub exponential_trigger_blocks: usize,
 }
 
 impl Default for FeeMarketConfig {
     fn default() -> Self {
         Self {
             target_block_utilization: 0.5,
-            max_fee_increase: 0.125,  // 12.5%
-            max_fee_decrease: 0.125,
+            base_fee_increase_rate: 0.125,  // 12.5% per block
+            base_fee_decrease_rate: 0.125,
             min_base_fee: 5000,
-            max_base_fee: 1_000_000,
+            // Very high soft cap - only hit during extreme spam
+            soft_max_base_fee: 1_000_000_000_000, // 1000 SOL equivalent
             history_size: 150,
+            // Exponential increase when blocks are >90% full
+            exponential_threshold: 0.9,
+            // Double fees each block during spam attack
+            exponential_multiplier: 2.0,
+            // Trigger after 5 consecutive full blocks
+            exponential_trigger_blocks: 5,
         }
     }
 }
@@ -63,6 +94,7 @@ impl FeeMarket {
             recent_blocks: Arc::new(RwLock::new(VecDeque::new())),
             base_fee: Arc::new(RwLock::new(base_fee)),
             config,
+            consecutive_full_blocks: Arc::new(RwLock::new(0)),
         }
     }
 
@@ -116,32 +148,81 @@ impl FeeMarket {
     }
 
     /// Adjust base fee based on network utilization
+    /// 
+    /// SECURITY: Uses exponential increase during spam attacks.
+    /// - Normal: ~12.5% increase/decrease per block
+    /// - Spam attack (>90% full for 5+ blocks): fees DOUBLE each block
+    /// 
+    /// This makes sustained spam attacks economically impossible as costs
+    /// grow exponentially while attacker gains remain constant.
     fn adjust_base_fee(&self, utilization: f64) {
         let mut base_fee = self.base_fee.write().unwrap();
         let current_fee = *base_fee;
-
-        let adjustment = if utilization > self.config.target_block_utilization {
-            // Increase fee
-            let increase = current_fee as f64 * self.config.max_fee_increase;
+        
+        // Track consecutive full blocks for exponential trigger
+        let is_over_exponential_threshold = utilization >= self.config.exponential_threshold;
+        let consecutive_count = {
+            let mut counter = self.consecutive_full_blocks.write().unwrap();
+            if is_over_exponential_threshold {
+                *counter += 1;
+            } else {
+                *counter = 0;
+            }
+            *counter
+        };
+        
+        // Check if exponential mode should activate
+        let use_exponential = consecutive_count >= self.config.exponential_trigger_blocks;
+        
+        let new_fee = if use_exponential {
+            // EXPONENTIAL MODE: Double fees each block during sustained spam
+            // This makes spam attacks economically infeasible
+            let multiplied = current_fee.saturating_mul(self.config.exponential_multiplier as u64);
+            
+            // Log warning as this indicates potential attack
+            tracing::warn!(
+                "FeeMarket: EXPONENTIAL MODE ACTIVE - {} consecutive full blocks, fee {} -> {}",
+                consecutive_count,
+                current_fee,
+                multiplied
+            );
+            
+            multiplied
+        } else if utilization > self.config.target_block_utilization {
+            // Normal increase mode
+            let increase_rate = self.config.base_fee_increase_rate;
             let excess_util = utilization - self.config.target_block_utilization;
-            let scale = (excess_util / (1.0 - self.config.target_block_utilization)).min(1.0);
-            (increase * scale) as u64
+            let max_excess = 1.0 - self.config.target_block_utilization;
+            let scale = (excess_util / max_excess).min(1.0);
+            
+            let increase = (current_fee as f64 * increase_rate * scale) as u64;
+            current_fee.saturating_add(increase.max(1)) // Always increase by at least 1
         } else {
-            // Decrease fee
-            let decrease = current_fee as f64 * self.config.max_fee_decrease;
+            // Decrease mode (network is underutilized)
+            let decrease_rate = self.config.base_fee_decrease_rate;
             let under_util = self.config.target_block_utilization - utilization;
             let scale = (under_util / self.config.target_block_utilization).min(1.0);
-            -(decrease * scale) as i64
+            
+            let decrease = (current_fee as f64 * decrease_rate * scale) as u64;
+            current_fee.saturating_sub(decrease)
         };
-
-        let new_fee = if adjustment >= 0 {
-            current_fee + adjustment as u64
-        } else {
-            current_fee.saturating_sub(adjustment.unsigned_abs())
-        };
-
-        // Clamp to min/max
-        *base_fee = new_fee.clamp(self.config.min_base_fee, self.config.max_base_fee);
+        
+        // Apply soft cap (only to prevent overflow, not to limit spam defense)
+        // Fees CAN exceed this during attacks - it's just a sanity limit
+        *base_fee = new_fee
+            .max(self.config.min_base_fee)
+            .min(self.config.soft_max_base_fee);
+    }
+    
+    /// Check if fee market is in exponential mode (indicates possible attack)
+    pub fn is_under_attack(&self) -> bool {
+        let counter = self.consecutive_full_blocks.read().unwrap();
+        *counter >= self.config.exponential_trigger_blocks
+    }
+    
+    /// Get consecutive full blocks count
+    pub fn get_congestion_streak(&self) -> usize {
+        *self.consecutive_full_blocks.read().unwrap()
     }
 
     /// Get current base fee

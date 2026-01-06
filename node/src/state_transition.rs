@@ -12,11 +12,47 @@ use crate::storage::Storage;
 /// Default LRU cache size for accounts (number of accounts to cache in memory)
 const DEFAULT_ACCOUNT_CACHE_SIZE: usize = 100_000;
 
+/// Backpressure status indicating memory pressure from dirty accounts
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BackpressureStatus {
+    /// Under soft limit - normal operation
+    Normal,
+    /// At soft limit - logging warnings, should flush soon
+    Soft,
+    /// At hard limit - forced flush in progress
+    Hard,
+    /// At critical limit - rejecting new transactions
+    Critical,
+}
+
 /// State transition function with LRU caching for scalable state management
 /// 
 /// Instead of loading all accounts into memory at startup, this uses
 /// a lazy-loading LRU cache that only keeps frequently accessed accounts
 /// in memory while reading others from disk on demand.
+/// Backpressure configuration for dirty account management
+/// 
+/// Prevents OOM by limiting how many dirty accounts can accumulate
+/// before forcing a flush to disk.
+pub struct BackpressureConfig {
+    /// Soft limit - start logging warnings
+    pub soft_limit: usize,
+    /// Hard limit - force flush and pause block processing
+    pub hard_limit: usize,
+    /// Critical limit - reject new transactions entirely
+    pub critical_limit: usize,
+}
+
+impl Default for BackpressureConfig {
+    fn default() -> Self {
+        Self {
+            soft_limit: 50_000,      // 50K accounts - start warning
+            hard_limit: 100_000,     // 100K accounts - force flush
+            critical_limit: 200_000, // 200K accounts - reject new txs
+        }
+    }
+}
+
 pub struct StateTransition {
     storage: Arc<Storage>,
     executor: Arc<TransactionExecutor>,
@@ -28,6 +64,10 @@ pub struct StateTransition {
     cache_stats: Arc<RwLock<CacheStats>>,
     /// Maximum cache size
     max_cache_size: usize,
+    /// Backpressure configuration for OOM prevention
+    backpressure_config: BackpressureConfig,
+    /// Flag indicating if we're in backpressure mode
+    backpressure_active: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Statistics for cache performance monitoring
@@ -91,7 +131,68 @@ impl StateTransition {
             dirty_accounts: Arc::new(RwLock::new(HashMap::new())),
             cache_stats: Arc::new(RwLock::new(CacheStats::default())),
             max_cache_size: cache_size.get(),
+            backpressure_config: BackpressureConfig::default(),
+            backpressure_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+    
+    /// Check dirty account backpressure status
+    /// 
+    /// Returns:
+    /// - Ok(()) if under soft limit
+    /// - Err with warning if approaching limit
+    /// - Forces flush if at hard limit
+    pub fn check_backpressure(&self) -> Result<BackpressureStatus> {
+        let dirty_count = self.dirty_accounts.read().unwrap().len();
+        
+        if dirty_count >= self.backpressure_config.critical_limit {
+            // CRITICAL: Too many dirty accounts - reject new transactions
+            self.backpressure_active.store(true, std::sync::atomic::Ordering::SeqCst);
+            tracing::error!(
+                "BACKPRESSURE CRITICAL: {} dirty accounts (limit: {}). Rejecting transactions.",
+                dirty_count, self.backpressure_config.critical_limit
+            );
+            return Ok(BackpressureStatus::Critical);
+        }
+        
+        if dirty_count >= self.backpressure_config.hard_limit {
+            // Hard limit - force flush immediately
+            self.backpressure_active.store(true, std::sync::atomic::Ordering::SeqCst);
+            tracing::warn!(
+                "BACKPRESSURE HARD: {} dirty accounts (limit: {}). Forcing flush.",
+                dirty_count, self.backpressure_config.hard_limit
+            );
+            
+            // Force synchronous flush
+            if let Err(e) = self.flush_dirty_accounts() {
+                tracing::error!("Failed to flush dirty accounts: {}", e);
+            }
+            
+            return Ok(BackpressureStatus::Hard);
+        }
+        
+        if dirty_count >= self.backpressure_config.soft_limit {
+            // Soft limit - log warning but continue
+            tracing::warn!(
+                "BACKPRESSURE SOFT: {} dirty accounts approaching limit (soft: {}, hard: {})",
+                dirty_count, self.backpressure_config.soft_limit, self.backpressure_config.hard_limit
+            );
+            return Ok(BackpressureStatus::Soft);
+        }
+        
+        // Clear backpressure flag if we're under limits
+        self.backpressure_active.store(false, std::sync::atomic::Ordering::SeqCst);
+        Ok(BackpressureStatus::Normal)
+    }
+    
+    /// Check if backpressure is currently active
+    pub fn is_backpressure_active(&self) -> bool {
+        self.backpressure_active.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    
+    /// Get dirty account count for monitoring
+    pub fn get_dirty_account_count(&self) -> usize {
+        self.dirty_accounts.read().unwrap().len()
     }
 
     /// Load state lazily - only loads metadata, not all accounts
@@ -200,7 +301,37 @@ impl StateTransition {
     }
     
     /// Update an account (marks as dirty for later persistence)
-    pub fn update_account(&self, address: Vec<u8>, account: Account) {
+    /// 
+    /// This function checks backpressure before adding to dirty accounts.
+    /// If at critical limit, returns error instead of risking OOM.
+    pub fn update_account(&self, address: Vec<u8>, account: Account) -> Result<()> {
+        // Check backpressure status before adding more dirty accounts
+        let status = self.check_backpressure()?;
+        
+        if status == BackpressureStatus::Critical {
+            return Err(anyhow::anyhow!(
+                "Cannot update account: backpressure critical limit reached ({} dirty accounts)",
+                self.get_dirty_account_count()
+            ));
+        }
+        
+        // Update cache
+        {
+            let mut cache = self.account_cache.write().unwrap();
+            cache.put(address.clone(), account.clone());
+        }
+        
+        // Mark as dirty
+        {
+            let mut dirty = self.dirty_accounts.write().unwrap();
+            dirty.insert(address, account);
+        }
+        
+        Ok(())
+    }
+    
+    /// Update account without backpressure check (for internal use during replay)
+    pub fn update_account_unchecked(&self, address: Vec<u8>, account: Account) {
         // Update cache
         {
             let mut cache = self.account_cache.write().unwrap();

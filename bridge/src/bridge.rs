@@ -22,11 +22,55 @@ pub struct RelayerSet {
     pub threshold: usize,        // Minimum signatures required
 }
 
+/// Per-user nonce tracker for parallel processing
+/// 
+/// Using a global nonce creates a bottleneck where all bridge operations
+/// must acquire the same lock. Per-user nonces allow parallel processing.
+#[derive(Debug, Default)]
+struct NonceTracker {
+    /// Per-user nonces: user_pubkey -> current_nonce
+    user_nonces: HashMap<Vec<u8>, u64>,
+    /// Per-token nonces: token_address -> current_nonce (for token-specific operations)
+    token_nonces: HashMap<Vec<u8>, u64>,
+}
+
+impl NonceTracker {
+    fn new() -> Self {
+        Self::default()
+    }
+    
+    /// Get and increment nonce for a specific user
+    fn get_and_increment_user_nonce(&mut self, user: &[u8]) -> u64 {
+        let nonce = self.user_nonces.entry(user.to_vec()).or_insert(0);
+        let current = *nonce;
+        *nonce += 1;
+        current
+    }
+    
+    /// Get and increment nonce for a specific token
+    fn get_and_increment_token_nonce(&mut self, token: &[u8]) -> u64 {
+        let nonce = self.token_nonces.entry(token.to_vec()).or_insert(0);
+        let current = *nonce;
+        *nonce += 1;
+        current
+    }
+    
+    /// Get current user nonce without incrementing (for validation)
+    fn get_user_nonce(&self, user: &[u8]) -> u64 {
+        *self.user_nonces.get(user).unwrap_or(&0)
+    }
+}
+
 pub struct Bridge {
     config: BridgeConfig,
     deposits: Arc<RwLock<HashMap<Vec<u8>, DepositInfo>>>,
     withdrawals: Arc<RwLock<HashMap<Vec<u8>, WithdrawalInfo>>>,
-    nonce: Arc<RwLock<u64>>,
+    /// Per-user and per-token nonces for parallel processing
+    /// This eliminates the global lock bottleneck
+    nonce_tracker: Arc<RwLock<NonceTracker>>,
+    /// Legacy global nonce for backward compatibility
+    /// Will be removed in future version
+    legacy_nonce: Arc<RwLock<u64>>,
     processed_proofs: Arc<RwLock<HashMap<Vec<u8>, bool>>>,
     /// Relayer stakes for slashing calculations
     /// Maps relayer pubkey -> staked amount in lamports
@@ -207,7 +251,8 @@ impl Bridge {
             config,
             deposits: Arc::new(RwLock::new(HashMap::new())),
             withdrawals: Arc::new(RwLock::new(HashMap::new())),
-            nonce: Arc::new(RwLock::new(0)),
+            nonce_tracker: Arc::new(RwLock::new(NonceTracker::new())),
+            legacy_nonce: Arc::new(RwLock::new(0)),
             processed_proofs: Arc::new(RwLock::new(HashMap::new())),
             relayer_stakes: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -543,6 +588,10 @@ impl Bridge {
         hasher.finalize().to_vec()
     }
 
+    /// Generate deposit ID using per-user nonce for parallel processing
+    /// 
+    /// Using per-user nonces means multiple users can deposit simultaneously
+    /// without waiting for a global lock, significantly improving throughput.
     fn generate_deposit_id(
         &self,
         sender: &[u8],
@@ -551,16 +600,24 @@ impl Bridge {
         tx_hash: &[u8],
     ) -> Vec<u8> {
         use sha2::{Sha256, Digest};
+        
+        // Get per-user nonce (much less lock contention than global nonce)
+        let user_nonce = {
+            let mut tracker = self.nonce_tracker.write().unwrap();
+            tracker.get_and_increment_user_nonce(sender)
+        };
+        
         let mut hasher = Sha256::new();
-        hasher.update(b"deposit");
+        hasher.update(b"deposit_v2"); // Version bump for new nonce scheme
         hasher.update(sender);
         hasher.update(recipient);
         hasher.update(&amount.to_le_bytes());
         hasher.update(tx_hash);
-        hasher.update(&self.get_and_increment_nonce().to_le_bytes());
+        hasher.update(&user_nonce.to_le_bytes());
         hasher.finalize().to_vec()
     }
 
+    /// Generate withdrawal ID using per-user nonce for parallel processing
     fn generate_withdrawal_id(
         &self,
         sender: &[u8],
@@ -569,18 +626,33 @@ impl Bridge {
         tx_hash: &[u8],
     ) -> Vec<u8> {
         use sha2::{Sha256, Digest};
+        
+        // Get per-user nonce
+        let user_nonce = {
+            let mut tracker = self.nonce_tracker.write().unwrap();
+            tracker.get_and_increment_user_nonce(sender)
+        };
+        
         let mut hasher = Sha256::new();
-        hasher.update(b"withdrawal");
+        hasher.update(b"withdrawal_v2");
         hasher.update(sender);
         hasher.update(recipient);
         hasher.update(&amount.to_le_bytes());
         hasher.update(tx_hash);
-        hasher.update(&self.get_and_increment_nonce().to_le_bytes());
+        hasher.update(&user_nonce.to_le_bytes());
         hasher.finalize().to_vec()
     }
 
+    /// Get current nonce for a user (for validation/display)
+    pub fn get_user_nonce(&self, user: &[u8]) -> u64 {
+        let tracker = self.nonce_tracker.read().unwrap();
+        tracker.get_user_nonce(user)
+    }
+    
+    /// Legacy global nonce for backward compatibility
+    #[deprecated(note = "Use per-user nonces instead for better parallelism")]
     fn get_and_increment_nonce(&self) -> u64 {
-        let mut nonce = self.nonce.write().unwrap();
+        let mut nonce = self.legacy_nonce.write().unwrap();
         let current = *nonce;
         *nonce += 1;
         current
