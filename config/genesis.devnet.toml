@@ -1,0 +1,45 @@
+# Ade Devnet Genesis Configuration
+# 
+# Minimal configuration for local development and testing.
+# 
+# Usage:
+#   ade-cli genesis generate --config config/genesis.devnet.toml --output genesis.bin
+
+[network]
+network_id = "ade-devnet"
+name = "Ade Devnet"
+chain_id = 1002
+block_time_ms = 400
+genesis_timestamp = 0
+
+[consensus]
+min_stake = 1000000000        # 1 SOL
+epoch_length = 8640           # ~1 hour at 400ms
+finality_confirmations = 8    # Fast finality for testing
+max_validators = 10
+inflation_rate_bps = 0        # No inflation for devnet
+slash_rate_bps = 1000
+
+# Single faucet account with lots of tokens for testing
+[[allocations]]
+address = "DevnetFaucet1111111111111111111111111111111"
+amount = 1000000000000000000  # 1 billion tokens for testing
+label = "Devnet Faucet"
+lockup_slots = 0
+
+# Single genesis validator
+[[validators]]
+pubkey = "DevnetValidator11111111111111111111111111111"
+stake = 100000000000          # 100 SOL stake
+commission_bps = 0            # No commission for devnet
+name = "Devnet Validator"
+website = ""
+
+[system_accounts]
+treasury = "DevnetTreasury11111111111111111111111111111"
+
+[ai_runtime]
+max_model_size = 104857600    # 100 MB
+max_compute_units = 10000000  # Higher limit for testing
+compute_unit_cost = 0         # Free compute for devnet
+

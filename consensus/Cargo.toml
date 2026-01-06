@@ -16,6 +16,8 @@ tracing.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 hex = "0.4"
+toml = "0.8"
+bs58 = "0.5"
 
 ade-transaction = { path = "../transaction" }
 

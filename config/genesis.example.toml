@@ -1,0 +1,143 @@
+# Ade Genesis Configuration
+# 
+# This is an example genesis configuration for Ade Sidechain.
+# Copy this file to genesis.toml and customize for your network.
+#
+# Generate genesis block:
+#   ade-cli genesis generate --config genesis.toml --output genesis.bin
+#
+# Start node with genesis:
+#   ade-node --genesis genesis.bin --data-dir ./data
+
+# =============================================================================
+# NETWORK CONFIGURATION
+# =============================================================================
+
+[network]
+# Unique network identifier - must be same across all nodes
+network_id = "ade-testnet"
+
+# Human-readable network name
+name = "Ade Testnet"
+
+# Chain ID for transaction signing (prevents replay attacks across chains)
+chain_id = 1001
+
+# Target block time in milliseconds
+block_time_ms = 400
+
+# Genesis timestamp (Unix timestamp, 0 = use current time at generation)
+genesis_timestamp = 0
+
+# =============================================================================
+# CONSENSUS CONFIGURATION
+# =============================================================================
+
+[consensus]
+# Minimum stake required to become a validator (in lamports)
+# 1 SOL = 1,000,000,000 lamports
+min_stake = 1000000000
+
+# Number of slots per epoch
+# 432000 slots * 400ms = ~48 hours (2 days)
+epoch_length = 432000
+
+# Number of confirmations required for finality
+finality_confirmations = 32
+
+# Maximum number of active validators
+max_validators = 100
+
+# Inflation rate per epoch (basis points, 100 = 1%)
+inflation_rate_bps = 500
+
+# Slashing percentage for misbehavior (basis points, 1000 = 10%)
+slash_rate_bps = 1000
+
+# =============================================================================
+# TOKEN ALLOCATIONS
+# =============================================================================
+# Initial token distribution at genesis
+
+[[allocations]]
+address = "Treasury111111111111111111111111111111111111"
+amount = 500000000000000000  # 500 million tokens
+label = "Treasury"
+lockup_slots = 0
+
+[[allocations]]
+address = "Team1111111111111111111111111111111111111111"
+amount = 100000000000000000  # 100 million tokens
+label = "Team"
+lockup_slots = 157680000  # 1 year lockup (365 * 24 * 60 * 60 / 0.4 * 1000)
+
+[[allocations]]
+address = "Ecosystem11111111111111111111111111111111111"
+amount = 200000000000000000  # 200 million tokens
+label = "Ecosystem Development"
+lockup_slots = 0
+
+[[allocations]]
+address = "Community1111111111111111111111111111111111"
+amount = 150000000000000000  # 150 million tokens
+label = "Community Rewards"
+lockup_slots = 0
+
+# =============================================================================
+# VALIDATORS
+# =============================================================================
+# Initial validator set
+
+[[validators]]
+pubkey = "Validator1PubkeyBase58EncodedHere111111111111"
+stake = 10000000000000  # 10,000 tokens
+commission_bps = 1000   # 10% commission
+name = "Genesis Validator 1"
+website = "https://validator1.ade.network"
+
+[[validators]]
+pubkey = "Validator2PubkeyBase58EncodedHere111111111111"
+stake = 10000000000000
+commission_bps = 800    # 8% commission
+name = "Genesis Validator 2"
+website = "https://validator2.ade.network"
+
+[[validators]]
+pubkey = "Validator3PubkeyBase58EncodedHere111111111111"
+stake = 10000000000000
+commission_bps = 1200   # 12% commission
+name = "Genesis Validator 3"
+website = "https://validator3.ade.network"
+
+# =============================================================================
+# SYSTEM ACCOUNTS
+# =============================================================================
+# Special accounts for protocol functionality
+
+[system_accounts]
+# Treasury receives protocol fees
+treasury = "Treasury111111111111111111111111111111111111"
+
+# Bridge program for cross-chain operations
+bridge_program = "BridgeProgram11111111111111111111111111111"
+
+# AI Runtime program for agent execution
+ai_runtime_program = "AIRuntime111111111111111111111111111111111"
+
+# Fee collector for transaction fees
+fee_collector = "FeeCollector1111111111111111111111111111111"
+
+# =============================================================================
+# AI RUNTIME CONFIGURATION
+# =============================================================================
+
+[ai_runtime]
+# Maximum model size in bytes (100 MB)
+max_model_size = 104857600
+
+# Maximum compute units per execution
+max_compute_units = 1000000
+
+# Cost per compute unit in lamports
+compute_unit_cost = 1
+

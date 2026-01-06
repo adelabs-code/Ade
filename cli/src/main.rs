@@ -20,6 +20,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Genesis block generation and management
+    Genesis(commands::genesis::GenesisArgs),
     /// Node management commands
     Node {
         #[command(subcommand)]
@@ -184,6 +186,9 @@ async fn main() -> Result<()> {
     }
 
     match cli.command {
+        Commands::Genesis(args) => {
+            commands::genesis::execute(args).await?;
+        }
         Commands::Node { action } => {
             commands::node::handle_node_command(action, &cli.rpc_url).await?;
         }
