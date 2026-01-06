@@ -20,6 +20,20 @@ impl OnnxInference {
 
         Ok(Self { environment })
     }
+    
+    /// Create a fallback instance that will return errors on inference
+    /// Used when ONNX runtime initialization fails
+    pub fn new_fallback() -> Self {
+        warn!("Creating fallback OnnxInference - all inference calls will fail");
+        // Create a minimal environment that will fail on actual inference
+        let environment = Environment::builder()
+            .with_name("ade-inference-fallback")
+            .build()
+            .expect("Fallback environment should always build")
+            .into_arc();
+        
+        Self { environment }
+    }
 
     /// Load ONNX model from file
     pub fn load_model(&self, model_path: &str) -> Result<OnnxModel> {

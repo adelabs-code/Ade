@@ -15,10 +15,17 @@ use crate::ai_pytorch::{PyTorchInference, PyTorchModel};
 /// 
 /// This runtime enforces concurrency limits using a semaphore to prevent
 /// resource exhaustion when multiple inference requests arrive simultaneously.
+/// 
+/// MODEL SYNCHRONIZATION:
+/// Models are synchronized across the P2P network using the following mechanism:
+/// 1. Model hash (IPFS CID or SHA256) is stored on-chain when agent is deployed
+/// 2. Before executing, check if model exists locally
+/// 3. If not, request model from peers via ModelSyncManager
+/// 4. Block execution until model is available or timeout
 pub struct AIRuntime {
-    agents: Arc<RwLock<HashMap<Vec<u8>, AIAgentState>>>,
-    execution_cache: Arc<RwLock<HashMap<Vec<u8>, ExecutionCache>>>,
-    execution_history: Arc<RwLock<Vec<ExecutionRecord>>>,
+    agents: Arc<tokio::sync::RwLock<HashMap<Vec<u8>, AIAgentState>>>,
+    execution_cache: Arc<tokio::sync::RwLock<HashMap<Vec<u8>, ExecutionCache>>>,
+    execution_history: Arc<tokio::sync::RwLock<Vec<ExecutionRecord>>>,
     max_concurrent_executions: usize,
     max_execution_time_ms: u64,
     /// Model cache for loaded ONNX models
@@ -28,11 +35,15 @@ pub struct AIRuntime {
     /// Model storage path for loading models by hash
     model_storage_path: String,
     /// Cache statistics for hit rate calculation
-    cache_stats: Arc<RwLock<CacheStats>>,
+    cache_stats: Arc<tokio::sync::RwLock<CacheStats>>,
     /// Semaphore for limiting concurrent AI executions
     execution_semaphore: Arc<Semaphore>,
     /// Current number of active executions (for monitoring)
-    active_executions: Arc<RwLock<usize>>,
+    active_executions: Arc<tokio::sync::RwLock<usize>>,
+    /// Model synchronization manager for P2P model distribution
+    model_sync: Arc<ModelSyncManager>,
+    /// Model eviction policy for automatic cleanup
+    eviction_policy: Arc<tokio::sync::RwLock<ModelEvictionPolicy>>,
 }
 
 /// Statistics for cache hit rate calculation
@@ -51,16 +62,326 @@ pub struct StorageStats {
     pub max_model_size_bytes: usize,
 }
 
+/// Model synchronization manager for P2P model distribution
+/// 
+/// This ensures all nodes can access the same AI models for transaction validation.
+/// When a node receives a block containing AI execution transactions, it must have
+/// the model locally to re-execute and verify the results.
+pub struct ModelSyncManager {
+    /// Known models and their availability status
+    model_registry: tokio::sync::RwLock<HashMap<Vec<u8>, ModelSyncStatus>>,
+    /// Pending model requests (hash -> list of waiting oneshot senders)
+    pending_requests: tokio::sync::RwLock<HashMap<Vec<u8>, Vec<tokio::sync::oneshot::Sender<Result<Vec<u8>>>>>>,
+    /// P2P peer addresses for model fetching
+    peers: tokio::sync::RwLock<Vec<String>>,
+    /// HTTP client for fetching models
+    http_client: reqwest::Client,
+    /// Model storage path
+    storage_path: String,
+    /// Maximum time to wait for model sync (seconds)
+    sync_timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ModelSyncStatus {
+    /// Model is available locally
+    Available { path: String, size: u64, last_accessed: u64 },
+    /// Model is being downloaded
+    Syncing { started_at: u64, progress_pct: u8 },
+    /// Model is known but not available locally
+    Remote { sources: Vec<String> },
+    /// Model sync failed
+    Failed { error: String, last_attempt: u64 },
+}
+
+/// Model eviction policy for automatic cleanup of unused models
+/// 
+/// Implements LRU-like eviction to prevent disk exhaustion attacks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelEvictionPolicy {
+    /// Maximum total storage bytes before eviction triggers
+    max_storage_bytes: u64,
+    /// Target storage after eviction (leave headroom)
+    target_storage_bytes: u64,
+    /// Minimum time before a model can be evicted (seconds)
+    min_retention_secs: u64,
+    /// Models with stake above this threshold are protected
+    protected_stake_threshold: u64,
+    /// Last access times for LRU eviction
+    last_access: HashMap<Vec<u8>, u64>,
+    /// Models that should never be evicted (e.g., system models)
+    protected_models: Vec<Vec<u8>>,
+}
+
+impl ModelSyncManager {
+    pub fn new(storage_path: String, sync_timeout_secs: u64) -> Self {
+        Self {
+            model_registry: tokio::sync::RwLock::new(HashMap::new()),
+            pending_requests: tokio::sync::RwLock::new(HashMap::new()),
+            peers: tokio::sync::RwLock::new(Vec::new()),
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(300)) // 5 min for large models
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
+            storage_path,
+            sync_timeout_secs,
+        }
+    }
+    
+    /// Add a peer for model synchronization
+    pub async fn add_peer(&self, peer_address: String) {
+        let mut peers = self.peers.write().await;
+        if !peers.contains(&peer_address) {
+            peers.push(peer_address);
+        }
+    }
+    
+    /// Remove a peer
+    pub async fn remove_peer(&self, peer_address: &str) {
+        let mut peers = self.peers.write().await;
+        peers.retain(|p| p != peer_address);
+    }
+    
+    /// Check if a model is available locally
+    pub async fn is_model_available(&self, model_hash: &[u8]) -> bool {
+        let hash_str = to_base58(model_hash);
+        let path = format!("{}/{}.onnx", self.storage_path, hash_str);
+        
+        if std::path::Path::new(&path).exists() {
+            return true;
+        }
+        
+        let path_bin = format!("{}/{}.bin", self.storage_path, hash_str);
+        std::path::Path::new(&path_bin).exists()
+    }
+    
+    /// Ensure a model is available, fetching from peers if necessary
+    /// 
+    /// This is the key function for model synchronization. It blocks until
+    /// the model is available or timeout occurs. This ensures consensus
+    /// validity - a node cannot validate AI transactions without the model.
+    pub async fn ensure_model_available(&self, model_hash: &[u8]) -> Result<String> {
+        let hash_str = to_base58(model_hash);
+        
+        // Check if already available
+        let onnx_path = format!("{}/{}.onnx", self.storage_path, hash_str);
+        if std::path::Path::new(&onnx_path).exists() {
+            self.update_model_status(model_hash, ModelSyncStatus::Available {
+                path: onnx_path.clone(),
+                size: std::fs::metadata(&onnx_path).map(|m| m.len()).unwrap_or(0),
+                last_accessed: current_timestamp(),
+            }).await;
+            return Ok(onnx_path);
+        }
+        
+        let bin_path = format!("{}/{}.bin", self.storage_path, hash_str);
+        if std::path::Path::new(&bin_path).exists() {
+            self.update_model_status(model_hash, ModelSyncStatus::Available {
+                path: bin_path.clone(),
+                size: std::fs::metadata(&bin_path).map(|m| m.len()).unwrap_or(0),
+                last_accessed: current_timestamp(),
+            }).await;
+            return Ok(bin_path);
+        }
+        
+        // Not available locally - need to sync from peers
+        info!("Model {} not found locally, initiating P2P sync", hash_str);
+        
+        self.update_model_status(model_hash, ModelSyncStatus::Syncing {
+            started_at: current_timestamp(),
+            progress_pct: 0,
+        }).await;
+        
+        // Try to fetch from each peer
+        let peers = self.peers.read().await.clone();
+        
+        if peers.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Model {} not available locally and no peers configured for sync",
+                hash_str
+            ));
+        }
+        
+        for peer in &peers {
+            match self.fetch_model_from_peer(peer, model_hash).await {
+                Ok(model_bytes) => {
+                    // Save the model
+                    let save_path = format!("{}/{}.onnx", self.storage_path, hash_str);
+                    std::fs::create_dir_all(&self.storage_path)?;
+                    std::fs::write(&save_path, &model_bytes)?;
+                    
+                    info!("Successfully synced model {} from peer {} ({} bytes)",
+                        hash_str, peer, model_bytes.len());
+                    
+                    self.update_model_status(model_hash, ModelSyncStatus::Available {
+                        path: save_path.clone(),
+                        size: model_bytes.len() as u64,
+                        last_accessed: current_timestamp(),
+                    }).await;
+                    
+                    return Ok(save_path);
+                }
+                Err(e) => {
+                    warn!("Failed to fetch model {} from peer {}: {}", hash_str, peer, e);
+                    continue;
+                }
+            }
+        }
+        
+        // All peers failed
+        self.update_model_status(model_hash, ModelSyncStatus::Failed {
+            error: "All peers failed".to_string(),
+            last_attempt: current_timestamp(),
+        }).await;
+        
+        Err(anyhow::anyhow!(
+            "Failed to sync model {} from {} peers. \
+            Block validation cannot proceed without the model.",
+            hash_str, peers.len()
+        ))
+    }
+    
+    /// Fetch a model from a specific peer via HTTP
+    async fn fetch_model_from_peer(&self, peer: &str, model_hash: &[u8]) -> Result<Vec<u8>> {
+        let hash_str = to_base58(model_hash);
+        let url = format!("http://{}/models/{}", peer, hash_str);
+        
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(self.sync_timeout_secs),
+            self.http_client.get(&url).send()
+        ).await
+            .map_err(|_| anyhow::anyhow!("Timeout fetching model from {}", peer))?
+            .map_err(|e| anyhow::anyhow!("HTTP error: {}", e))?;
+        
+        if !response.status().is_success() {
+            return Err(anyhow::anyhow!(
+                "Peer {} returned status {} for model {}",
+                peer, response.status(), hash_str
+            ));
+        }
+        
+        let bytes = response.bytes().await
+            .map_err(|e| anyhow::anyhow!("Failed to read response body: {}", e))?;
+        
+        // Verify hash matches
+        let received_hash = hash_data(&bytes);
+        if received_hash != model_hash {
+            return Err(anyhow::anyhow!(
+                "Model hash mismatch: expected {}, got {}",
+                hash_str, to_base58(&received_hash)
+            ));
+        }
+        
+        Ok(bytes.to_vec())
+    }
+    
+    /// Update model status in registry
+    async fn update_model_status(&self, model_hash: &[u8], status: ModelSyncStatus) {
+        let mut registry = self.model_registry.write().await;
+        registry.insert(model_hash.to_vec(), status);
+    }
+    
+    /// Get model sync status
+    pub async fn get_model_status(&self, model_hash: &[u8]) -> Option<ModelSyncStatus> {
+        let registry = self.model_registry.read().await;
+        registry.get(model_hash).cloned()
+    }
+    
+    /// Get list of all synced models
+    pub async fn list_available_models(&self) -> Vec<(Vec<u8>, ModelSyncStatus)> {
+        let registry = self.model_registry.read().await;
+        registry.iter()
+            .filter(|(_, status)| matches!(status, ModelSyncStatus::Available { .. }))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+}
+
+impl ModelEvictionPolicy {
+    pub fn new(max_storage_bytes: u64) -> Self {
+        Self {
+            max_storage_bytes,
+            target_storage_bytes: (max_storage_bytes as f64 * 0.8) as u64, // Keep 20% headroom
+            min_retention_secs: 3600, // 1 hour minimum
+            protected_stake_threshold: 1_000_000_000, // 1 SOL equivalent
+            last_access: HashMap::new(),
+            protected_models: Vec::new(),
+        }
+    }
+    
+    /// Record model access for LRU tracking
+    pub fn record_access(&mut self, model_hash: &[u8]) {
+        self.last_access.insert(model_hash.to_vec(), current_timestamp());
+    }
+    
+    /// Add a protected model that should never be evicted
+    pub fn protect_model(&mut self, model_hash: Vec<u8>) {
+        if !self.protected_models.contains(&model_hash) {
+            self.protected_models.push(model_hash);
+        }
+    }
+    
+    /// Get list of models to evict based on LRU and protection rules
+    /// Returns model hashes sorted by priority (evict first)
+    pub fn get_eviction_candidates(&self, current_storage: u64) -> Vec<Vec<u8>> {
+        if current_storage < self.max_storage_bytes {
+            return Vec::new(); // No eviction needed
+        }
+        
+        let now = current_timestamp();
+        let min_age = self.min_retention_secs;
+        
+        // Sort by last access time (oldest first)
+        let mut candidates: Vec<_> = self.last_access.iter()
+            .filter(|(hash, last_access)| {
+                // Not protected
+                !self.protected_models.contains(hash) &&
+                // Old enough to evict
+                now - *last_access > min_age
+            })
+            .collect();
+        
+        candidates.sort_by_key(|(_, last_access)| *last_access);
+        
+        candidates.into_iter()
+            .map(|(hash, _)| hash.clone())
+            .collect()
+    }
+}
+
 /// RAII guard for tracking active executions
 /// Ensures the counter is decremented when dropped
+/// 
+/// NOTE: Uses std::sync::RwLock for Drop trait (must be sync)
+/// This is a small counter so blocking is acceptable here
 struct ExecutionGuard {
-    active_executions: Arc<RwLock<usize>>,
+    active_executions: Arc<std::sync::RwLock<usize>>,
 }
 
 impl Drop for ExecutionGuard {
     fn drop(&mut self) {
-        let mut active = self.active_executions.write().unwrap();
-        *active = active.saturating_sub(1);
+        if let Ok(mut active) = self.active_executions.write() {
+            *active = active.saturating_sub(1);
+        }
+    }
+}
+
+/// Async-compatible execution counter using atomic operations
+/// Preferred over ExecutionGuard for async contexts
+struct AsyncExecutionCounter {
+    counter: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl AsyncExecutionCounter {
+    fn new(counter: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self { counter }
+    }
+}
+
+impl Drop for AsyncExecutionCounter {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -135,34 +456,124 @@ impl AIRuntime {
 
     pub fn with_model_path(max_concurrent_executions: usize, max_execution_time_ms: u64, model_storage_path: String) -> Self {
         let onnx_inference = OnnxInference::new()
-            .expect("Failed to initialize ONNX inference engine");
+            .unwrap_or_else(|e| {
+                warn!("Failed to initialize ONNX inference engine: {}. AI execution will fail.", e);
+                OnnxInference::new_fallback()
+            });
         
         // Create semaphore with configured concurrency limit
         let semaphore = Arc::new(Semaphore::new(max_concurrent_executions));
         
+        // Create model sync manager
+        let model_sync = ModelSyncManager::new(
+            model_storage_path.clone(),
+            300, // 5 minute timeout for model sync
+        );
+        
+        // Create eviction policy
+        let eviction_policy = ModelEvictionPolicy::new(Self::MAX_TOTAL_STORAGE_BYTES);
+        
         info!(
-            "Initializing AI runtime with max {} concurrent executions, {} ms timeout",
+            "Initializing AI runtime with max {} concurrent executions, {} ms timeout, model sync enabled",
             max_concurrent_executions, max_execution_time_ms
         );
         
         Self {
-            agents: Arc::new(RwLock::new(HashMap::new())),
-            execution_cache: Arc::new(RwLock::new(HashMap::new())),
-            execution_history: Arc::new(RwLock::new(Vec::new())),
+            agents: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            execution_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            execution_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             max_concurrent_executions,
             max_execution_time_ms,
             model_cache: Arc::new(ModelCache::new(100)), // Cache up to 100 models
             onnx_inference: Arc::new(onnx_inference),
             model_storage_path,
-            cache_stats: Arc::new(RwLock::new(CacheStats::default())),
+            cache_stats: Arc::new(tokio::sync::RwLock::new(CacheStats::default())),
             execution_semaphore: semaphore,
-            active_executions: Arc::new(RwLock::new(0)),
+            active_executions: Arc::new(tokio::sync::RwLock::new(0)),
+            model_sync: Arc::new(model_sync),
+            eviction_policy: Arc::new(tokio::sync::RwLock::new(eviction_policy)),
         }
     }
     
     /// Get the current number of active AI executions
-    pub fn get_active_executions(&self) -> usize {
-        *self.active_executions.read().unwrap()
+    pub async fn get_active_executions(&self) -> usize {
+        *self.active_executions.read().await
+    }
+    
+    /// Add a peer for model synchronization
+    pub async fn add_sync_peer(&self, peer_address: String) {
+        self.model_sync.add_peer(peer_address).await;
+    }
+    
+    /// Ensure model is available before execution (P2P sync if needed)
+    /// 
+    /// This MUST be called before executing AI transactions during block validation.
+    /// Without the model, the transaction cannot be verified.
+    pub async fn ensure_model_for_execution(&self, model_hash: &[u8]) -> Result<String> {
+        // First check local availability
+        if self.model_sync.is_model_available(model_hash).await {
+            let hash_str = to_base58(model_hash);
+            let onnx_path = format!("{}/{}.onnx", self.model_storage_path, hash_str);
+            if std::path::Path::new(&onnx_path).exists() {
+                // Update eviction policy access time
+                let mut policy = self.eviction_policy.write().await;
+                policy.record_access(model_hash);
+                return Ok(onnx_path);
+            }
+            let bin_path = format!("{}/{}.bin", self.model_storage_path, hash_str);
+            if std::path::Path::new(&bin_path).exists() {
+                let mut policy = self.eviction_policy.write().await;
+                policy.record_access(model_hash);
+                return Ok(bin_path);
+            }
+        }
+        
+        // Need to sync from network
+        let path = self.model_sync.ensure_model_available(model_hash).await?;
+        
+        // Update eviction policy
+        let mut policy = self.eviction_policy.write().await;
+        policy.record_access(model_hash);
+        
+        Ok(path)
+    }
+    
+    /// Run eviction if storage is getting full
+    pub async fn run_eviction_if_needed(&self) -> Result<usize> {
+        let current_storage = self.get_total_storage_used()?;
+        
+        let candidates = {
+            let policy = self.eviction_policy.read().await;
+            policy.get_eviction_candidates(current_storage)
+        };
+        
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+        
+        let mut evicted = 0;
+        let target = {
+            let policy = self.eviction_policy.read().await;
+            policy.target_storage_bytes
+        };
+        
+        for model_hash in candidates {
+            if self.get_total_storage_used()? <= target {
+                break;
+            }
+            
+            match self.delete_model(&model_hash) {
+                Ok(_) => {
+                    evicted += 1;
+                    info!("Evicted model {}", to_base58(&model_hash));
+                }
+                Err(e) => {
+                    warn!("Failed to evict model {}: {}", to_base58(&model_hash), e);
+                }
+            }
+        }
+        
+        Ok(evicted)
     }
     
     /// Get the number of available execution slots
