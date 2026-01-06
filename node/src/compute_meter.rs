@@ -192,28 +192,108 @@ pub struct ComputeStats {
     pub operation_counts: HashMap<String, usize>,
 }
 
-/// AI-specific compute estimation
+/// Model specification for accurate compute estimation
+#[derive(Debug, Clone)]
+pub struct ModelSpec {
+    /// Model architecture type
+    pub model_type: String,
+    /// Number of parameters (in millions)
+    pub param_count_m: f64,
+    /// Number of layers
+    pub num_layers: usize,
+    /// Hidden dimension size
+    pub hidden_dim: usize,
+    /// Number of attention heads (for transformers)
+    pub num_heads: usize,
+    /// Context window size
+    pub context_length: usize,
+}
+
+impl Default for ModelSpec {
+    fn default() -> Self {
+        Self {
+            model_type: "transformer".to_string(),
+            param_count_m: 125.0, // ~125M params (GPT-2 small)
+            num_layers: 12,
+            hidden_dim: 768,
+            num_heads: 12,
+            context_length: 1024,
+        }
+    }
+}
+
+/// AI-specific compute estimation - PRODUCTION implementation
+/// 
+/// Calculates compute units based on actual model architecture.
 pub struct AIComputeEstimator;
 
 impl AIComputeEstimator {
-    /// Estimate compute for inference
+    /// Estimate compute with detailed model specification
+    /// 
+    /// Uses FLOPs-based estimation for accurate resource pricing.
+    pub fn estimate_with_spec(
+        spec: &ModelSpec,
+        input_tokens: usize,
+        output_tokens: usize,
+    ) -> u64 {
+        let total_tokens = input_tokens + output_tokens;
+        let params = (spec.param_count_m * 1_000_000.0) as u64;
+        
+        match spec.model_type.as_str() {
+            "transformer" | "gpt" | "llama" | "bert" => {
+                // Forward: 2 * params * tokens
+                // Attention: O(n² * d) per layer
+                let forward = 2 * params * (total_tokens as u64);
+                let attention = (spec.hidden_dim as u64) * 
+                    (total_tokens as u64).pow(2) / 1000 * 
+                    (spec.num_layers as u64);
+                
+                ((forward + attention) / 1000).max(1000)
+            }
+            "cnn" | "resnet" => {
+                let base = params * ((input_tokens as f64).sqrt() as u64).max(1);
+                (base / 1000).max(500)
+            }
+            "rnn" | "lstm" | "gru" => {
+                let gates = if spec.model_type == "lstm" { 4 } else { 3 };
+                let flops = (spec.hidden_dim as u64).pow(2) * gates * 
+                    (total_tokens as u64) * (spec.num_layers as u64);
+                (flops / 1000).max(500)
+            }
+            _ => {
+                let estimated = 2 * params * (total_tokens as u64);
+                (estimated / 1000).max(1000)
+            }
+        }
+    }
+    
+    /// Legacy estimation (backward compatible)
     pub fn estimate_inference(
         model_type: &str,
         input_tokens: usize,
         max_output_tokens: usize,
     ) -> u64 {
-        let base_costs = match model_type {
-            "transformer" => (10000, 100),
-            "cnn" => (5000, 50),
-            "rnn" => (7000, 75),
-            _ => (8000, 80),
+        let spec = match model_type {
+            "transformer" => ModelSpec {
+                model_type: "transformer".to_string(),
+                param_count_m: 125.0,
+                num_layers: 12,
+                hidden_dim: 768,
+                num_heads: 12,
+                context_length: 1024,
+            },
+            "cnn" => ModelSpec {
+                model_type: "cnn".to_string(),
+                param_count_m: 25.0,
+                num_layers: 50,
+                hidden_dim: 2048,
+                num_heads: 0,
+                context_length: 0,
+            },
+            _ => ModelSpec::default(),
         };
-
-        let (model_load, per_token) = base_costs;
         
-        model_load +
-        (input_tokens as u64 * per_token) +
-        (max_output_tokens as u64 * per_token)
+        Self::estimate_with_spec(&spec, input_tokens, max_output_tokens)
     }
 
     /// Estimate compute for embeddings
@@ -221,11 +301,9 @@ impl AIComputeEstimator {
         input_tokens: usize,
         embedding_dim: usize,
     ) -> u64 {
-        let base = 500u64;
-        let per_token = 50u64;
-        let dim_cost = (embedding_dim as u64 / 100).max(1);
-        
-        base + (input_tokens as u64 * per_token * dim_cost)
+        let lookup = input_tokens as u64 * 10;
+        let projection = (input_tokens as u64) * (embedding_dim as u64) / 100;
+        (lookup + projection).max(100)
     }
 
     /// Estimate compute for fine-tuning

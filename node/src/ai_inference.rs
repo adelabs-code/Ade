@@ -232,11 +232,15 @@ impl ModelCache {
 
 /// Byte-Pair Encoding (BPE) Tokenizer for transformer models
 /// 
-/// This tokenizer implements a simplified BPE algorithm compatible with
-/// GPT-2/GPT-3 style models. It supports:
-/// - Vocabulary-based token lookup
-/// - Subword tokenization with byte fallback
-/// - Special tokens (PAD, UNK, BOS, EOS)
+/// PRODUCTION IMPLEMENTATION:
+/// - Loads vocabulary from vocab.json (HuggingFace/OpenAI format)
+/// - Loads merge rules from merges.txt
+/// - Supports GPT-2, GPT-J, LLaMA, and similar architectures
+/// - Falls back to byte-level encoding for unknown tokens
+/// 
+/// File formats supported:
+/// - vocab.json: {"token": id, ...} mapping
+/// - merges.txt: "token1 token2" pairs, one per line (first line is header)
 pub struct BPETokenizer {
     /// Vocabulary mapping token strings to IDs
     vocab: HashMap<String, i64>,
@@ -244,11 +248,15 @@ pub struct BPETokenizer {
     reverse_vocab: HashMap<i64, String>,
     /// Merge rules for BPE (pair -> merged token)
     merges: Vec<(String, String)>,
+    /// Merge priority lookup for O(1) access
+    merge_ranks: HashMap<(String, String), usize>,
     /// Special token IDs
     pad_token_id: i64,
     unk_token_id: i64,
     bos_token_id: i64,
     eos_token_id: i64,
+    /// Source of the vocabulary (for debugging/logging)
+    vocab_source: String,
 }
 
 impl Default for BPETokenizer {
@@ -258,7 +266,10 @@ impl Default for BPETokenizer {
 }
 
 impl BPETokenizer {
-    /// Create a new tokenizer with default vocabulary
+    /// Create a new tokenizer with minimal fallback vocabulary
+    /// 
+    /// WARNING: This creates a byte-level tokenizer for testing only.
+    /// For production, use from_json() or from_files() to load a real vocabulary.
     pub fn new() -> Self {
         let mut vocab = HashMap::new();
         let mut reverse_vocab = HashMap::new();
@@ -268,71 +279,201 @@ impl BPETokenizer {
         vocab.insert("<UNK>".to_string(), 1);
         vocab.insert("<BOS>".to_string(), 2);
         vocab.insert("<EOS>".to_string(), 3);
-        
-        // Build basic vocabulary (ASCII printable + common subwords)
-        let mut token_id = 4i64;
-        
-        // Single bytes (256 tokens for byte-level BPE)
-        for byte in 0u8..=255 {
-            let token = format!("<0x{:02X}>", byte);
-            vocab.insert(token.clone(), token_id);
-            reverse_vocab.insert(token_id, token);
-            token_id += 1;
-        }
-        
-        // Common words and subwords for English
-        let common_tokens = [
-            " the", " a", " an", " is", " are", " was", " were", " be", " been",
-            " have", " has", " had", " do", " does", " did", " will", " would",
-            " could", " should", " can", " may", " might", " must", " shall",
-            " to", " of", " in", " for", " on", " with", " at", " by", " from",
-            " or", " and", " not", " this", " that", " it", " as", " but",
-            "ing", "tion", "ed", "er", "ly", "ment", "ness", "able", "ible",
-            "ful", "less", "ous", "ive", "ize", "ise", "ation", "ence", "ance",
-            ".", ",", "!", "?", ":", ";", "'", "\"", "(", ")", "[", "]", "{", "}",
-            " ", "\n", "\t",
-        ];
-        
-        for token in common_tokens {
-            if !vocab.contains_key(token) {
-                vocab.insert(token.to_string(), token_id);
-                reverse_vocab.insert(token_id, token.to_string());
-                token_id += 1;
-            }
-        }
-        
-        // Build reverse vocab for special tokens
         reverse_vocab.insert(0, "<PAD>".to_string());
         reverse_vocab.insert(1, "<UNK>".to_string());
         reverse_vocab.insert(2, "<BOS>".to_string());
         reverse_vocab.insert(3, "<EOS>".to_string());
         
-        // Default merge rules (in production, load from vocab file)
-        let merges = vec![
-            ("t".to_string(), "h".to_string()),    // th
-            ("th".to_string(), "e".to_string()),   // the
-            ("i".to_string(), "n".to_string()),    // in
-            ("a".to_string(), "n".to_string()),    // an
-            ("e".to_string(), "r".to_string()),    // er
-            ("o".to_string(), "n".to_string()),    // on
-            ("e".to_string(), "n".to_string()),    // en
-            ("t".to_string(), "i".to_string()),    // ti
-            ("ti".to_string(), "on".to_string()),  // tion
-            ("i".to_string(), "ng".to_string()),   // ing
-        ];
+        // Build byte-level vocabulary (256 tokens for byte fallback)
+        for byte in 0u8..=255 {
+            let token = Self::byte_to_unicode(byte);
+            let id = 4 + byte as i64;
+            vocab.insert(token.clone(), id);
+            reverse_vocab.insert(id, token);
+        }
         
         Self {
             vocab,
             reverse_vocab,
-            merges,
+            merges: Vec::new(),
+            merge_ranks: HashMap::new(),
             pad_token_id: 0,
             unk_token_id: 1,
             bos_token_id: 2,
             eos_token_id: 3,
+            vocab_source: "byte-level-fallback".to_string(),
         }
     }
     
-    /// Load tokenizer from vocabulary and merges files
+    /// Load tokenizer from HuggingFace-format JSON files (PRODUCTION)
+    /// 
+    /// This is the recommended way to load a tokenizer for production use.
+    /// Supports GPT-2, GPT-J, LLaMA, and similar model vocabularies.
+    /// 
+    /// # Arguments
+    /// * `vocab_path` - Path to vocab.json ({"token": id, ...} format)
+    /// * `merges_path` - Path to merges.txt (BPE merge rules)
+    /// 
+    /// # Example
+    /// ```no_run
+    /// let tokenizer = BPETokenizer::from_json("models/gpt2/vocab.json", "models/gpt2/merges.txt")?;
+    /// ```
+    pub fn from_json(vocab_path: &str, merges_path: &str) -> Result<Self> {
+        use tracing::info;
+        
+        info!("Loading tokenizer from {} and {}", vocab_path, merges_path);
+        
+        // Load vocab.json
+        let vocab_content = std::fs::read_to_string(vocab_path)
+            .context(format!("Failed to read vocab file: {}", vocab_path))?;
+        
+        let vocab_json: serde_json::Value = serde_json::from_str(&vocab_content)
+            .context("Failed to parse vocab.json as JSON")?;
+        
+        let mut vocab = HashMap::new();
+        let mut reverse_vocab = HashMap::new();
+        
+        // Parse vocab.json (format: {"token": id, ...})
+        if let serde_json::Value::Object(map) = vocab_json {
+            for (token, id_value) in map {
+                if let Some(id) = id_value.as_i64() {
+                    vocab.insert(token.clone(), id);
+                    reverse_vocab.insert(id, token);
+                }
+            }
+        } else {
+            return Err(anyhow::anyhow!("vocab.json must be a JSON object"));
+        }
+        
+        info!("Loaded {} tokens from vocab.json", vocab.len());
+        
+        // Load merges.txt
+        let merges_content = std::fs::read_to_string(merges_path)
+            .context(format!("Failed to read merges file: {}", merges_path))?;
+        
+        let mut merges = Vec::new();
+        let mut merge_ranks = HashMap::new();
+        
+        for (idx, line) in merges_content.lines().enumerate() {
+            // Skip header line (usually "#version: ...")
+            if line.starts_with('#') || line.trim().is_empty() {
+                continue;
+            }
+            
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                let pair = (parts[0].to_string(), parts[1].to_string());
+                merge_ranks.insert(pair.clone(), merges.len());
+                merges.push(pair);
+            }
+        }
+        
+        info!("Loaded {} merge rules from merges.txt", merges.len());
+        
+        // Determine special token IDs from vocab
+        let pad_token_id = vocab.get("<pad>").or(vocab.get("<PAD>")).copied().unwrap_or(0);
+        let unk_token_id = vocab.get("<unk>").or(vocab.get("<UNK>")).copied().unwrap_or(1);
+        let bos_token_id = vocab.get("<bos>").or(vocab.get("<s>")).or(vocab.get("<BOS>")).copied().unwrap_or(2);
+        let eos_token_id = vocab.get("<eos>").or(vocab.get("</s>")).or(vocab.get("<EOS>")).copied().unwrap_or(3);
+        
+        Ok(Self {
+            vocab,
+            reverse_vocab,
+            merges,
+            merge_ranks,
+            pad_token_id,
+            unk_token_id,
+            bos_token_id,
+            eos_token_id,
+            vocab_source: vocab_path.to_string(),
+        })
+    }
+    
+    /// Load from HuggingFace tokenizer.json (single file format)
+    /// 
+    /// This format is used by newer HuggingFace tokenizers and contains
+    /// both vocabulary and merge rules in a single file.
+    pub fn from_tokenizer_json(path: &str) -> Result<Self> {
+        use tracing::info;
+        
+        info!("Loading tokenizer from {}", path);
+        
+        let content = std::fs::read_to_string(path)
+            .context(format!("Failed to read tokenizer.json: {}", path))?;
+        
+        let json: serde_json::Value = serde_json::from_str(&content)
+            .context("Failed to parse tokenizer.json")?;
+        
+        let mut vocab = HashMap::new();
+        let mut reverse_vocab = HashMap::new();
+        let mut merges = Vec::new();
+        let mut merge_ranks = HashMap::new();
+        
+        // Parse model.vocab
+        if let Some(model) = json.get("model") {
+            if let Some(vocab_obj) = model.get("vocab").and_then(|v| v.as_object()) {
+                for (token, id_value) in vocab_obj {
+                    if let Some(id) = id_value.as_i64() {
+                        vocab.insert(token.clone(), id);
+                        reverse_vocab.insert(id, token.clone());
+                    }
+                }
+            }
+            
+            // Parse model.merges
+            if let Some(merges_arr) = model.get("merges").and_then(|m| m.as_array()) {
+                for (idx, merge_value) in merges_arr.iter().enumerate() {
+                    if let Some(merge_str) = merge_value.as_str() {
+                        let parts: Vec<&str> = merge_str.split_whitespace().collect();
+                        if parts.len() >= 2 {
+                            let pair = (parts[0].to_string(), parts[1].to_string());
+                            merge_ranks.insert(pair.clone(), idx);
+                            merges.push(pair);
+                        }
+                    }
+                }
+            }
+        }
+        
+        info!("Loaded {} tokens and {} merges from tokenizer.json", vocab.len(), merges.len());
+        
+        // Parse added_tokens for special tokens
+        let mut pad_token_id = 0i64;
+        let mut unk_token_id = 1i64;
+        let mut bos_token_id = 2i64;
+        let mut eos_token_id = 3i64;
+        
+        if let Some(added_tokens) = json.get("added_tokens").and_then(|a| a.as_array()) {
+            for token_obj in added_tokens {
+                if let (Some(content), Some(id)) = (
+                    token_obj.get("content").and_then(|c| c.as_str()),
+                    token_obj.get("id").and_then(|i| i.as_i64())
+                ) {
+                    match content {
+                        "<pad>" | "<PAD>" | "[PAD]" => pad_token_id = id,
+                        "<unk>" | "<UNK>" | "[UNK]" => unk_token_id = id,
+                        "<bos>" | "<s>" | "<BOS>" | "[CLS]" => bos_token_id = id,
+                        "<eos>" | "</s>" | "<EOS>" | "[SEP]" => eos_token_id = id,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        
+        Ok(Self {
+            vocab,
+            reverse_vocab,
+            merges,
+            merge_ranks,
+            pad_token_id,
+            unk_token_id,
+            bos_token_id,
+            eos_token_id,
+            vocab_source: path.to_string(),
+        })
+    }
+    
+    /// Load tokenizer from legacy text format files
     pub fn from_files(vocab_path: &str, merges_path: &str) -> Result<Self> {
         let vocab_content = std::fs::read_to_string(vocab_path)
             .context("Failed to read vocab file")?;
@@ -351,10 +492,17 @@ impl BPETokenizer {
             .context("Failed to read merges file")?;
         
         let mut merges = Vec::new();
-        for line in merges_content.lines().skip(1) { // Skip header
+        let mut merge_ranks = HashMap::new();
+        
+        for line in merges_content.lines() {
+            if line.starts_with('#') || line.trim().is_empty() {
+                continue;
+            }
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 2 {
-                merges.push((parts[0].to_string(), parts[1].to_string()));
+                let pair = (parts[0].to_string(), parts[1].to_string());
+                merge_ranks.insert(pair.clone(), merges.len());
+                merges.push(pair);
             }
         }
         
@@ -362,11 +510,40 @@ impl BPETokenizer {
             vocab,
             reverse_vocab,
             merges,
+            merge_ranks,
             pad_token_id: 0,
             unk_token_id: 1,
             bos_token_id: 2,
             eos_token_id: 3,
+            vocab_source: vocab_path.to_string(),
         })
+    }
+    
+    /// Convert byte to unicode character (GPT-2 style byte encoding)
+    fn byte_to_unicode(byte: u8) -> String {
+        // GPT-2 uses a specific mapping to avoid control characters
+        let ch = match byte {
+            0..=32 => (byte as u32 + 256) as char,
+            127..=160 => ((byte as u32 - 127) + 256 + 33) as char,
+            _ => byte as char,
+        };
+        ch.to_string()
+    }
+    
+    /// Get vocabulary size
+    pub fn vocab_size(&self) -> usize {
+        self.vocab.len()
+    }
+    
+    /// Check if tokenizer has a proper vocabulary loaded
+    pub fn is_production_ready(&self) -> bool {
+        // A production tokenizer should have at least 1000 tokens
+        self.vocab.len() > 1000 && !self.merges.is_empty()
+    }
+    
+    /// Get vocabulary source (for debugging)
+    pub fn get_vocab_source(&self) -> &str {
+        &self.vocab_source
     }
     
     /// Encode text to token IDs using BPE

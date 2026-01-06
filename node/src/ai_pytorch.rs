@@ -100,18 +100,81 @@ impl PyTorchModel {
 }
 
 // Stub implementations when pytorch feature is disabled
+// 
+// IMPORTANT: When building without --features pytorch:
+// - PyTorchInference::new() returns a descriptive error
+// - All methods return clear error messages explaining how to enable PyTorch
+// - Use ONNX backend as an alternative for inference
 #[cfg(not(feature = "pytorch"))]
 pub struct PyTorchInference;
 
 #[cfg(not(feature = "pytorch"))]
 impl PyTorchInference {
-    pub fn new() -> Result<Self, &'static str> {
-        Err("PyTorch support not enabled. Build with --features pytorch")
+    /// Attempt to create PyTorch inference (fails without pytorch feature)
+    /// 
+    /// # Returns
+    /// Error explaining how to enable PyTorch support
+    /// 
+    /// # Enabling PyTorch
+    /// ```bash
+    /// cargo build --features pytorch
+    /// ```
+    /// 
+    /// # Alternative
+    /// Use ONNX inference which works without additional features:
+    /// ```rust
+    /// use ade_node::ai_inference::OnnxInference;
+    /// let inference = OnnxInference::new()?;
+    /// ```
+    pub fn new() -> std::result::Result<Self, PyTorchError> {
+        Err(PyTorchError::NotEnabled)
+    }
+    
+    /// Check if PyTorch is available
+    pub fn is_available() -> bool {
+        false
+    }
+}
+
+/// Error type for PyTorch operations when feature is disabled
+#[cfg(not(feature = "pytorch"))]
+#[derive(Debug, Clone)]
+pub enum PyTorchError {
+    NotEnabled,
+    ModelNotLoaded,
+    InferenceError(String),
+}
+
+#[cfg(not(feature = "pytorch"))]
+impl std::fmt::Display for PyTorchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PyTorchError::NotEnabled => write!(f, 
+                "PyTorch support not enabled. To enable:\n\
+                 1. Install libtorch: https://pytorch.org/get-started/locally/\n\
+                 2. Set LIBTORCH env var to installation path\n\
+                 3. Build with: cargo build --features pytorch\n\
+                 \n\
+                 Alternative: Use ONNX inference (enabled by default)"
+            ),
+            PyTorchError::ModelNotLoaded => write!(f, "No PyTorch model loaded"),
+            PyTorchError::InferenceError(msg) => write!(f, "Inference error: {}", msg),
+        }
     }
 }
 
 #[cfg(not(feature = "pytorch"))]
+impl std::error::Error for PyTorchError {}
+
+#[cfg(not(feature = "pytorch"))]
 pub struct PyTorchModel;
+
+#[cfg(not(feature = "pytorch"))]
+impl PyTorchModel {
+    pub fn infer(&self, _input: &[f32]) -> std::result::Result<Vec<f32>, PyTorchError> {
+        Err(PyTorchError::NotEnabled)
+    }
+}
 
 /// Unified model interface
 pub enum ModelBackend {
