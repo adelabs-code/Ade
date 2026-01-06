@@ -1,10 +1,12 @@
 use axum::Json;
 use crate::server::RpcState;
 use crate::types::RpcResponse;
-use crate::state::{TransactionInfo, TransactionStatus, AIAgentData};
+use crate::state::{TransactionInfo, TransactionStatus, AIAgentData, ExecutionRecord};
+use crate::ai_runtime_types;
 use serde_json::json;
 use sha2::{Sha256, Digest};
 use tracing::{info, debug, warn};
+use base64;
 
 // ============================================================================
 // Block Methods
@@ -922,6 +924,13 @@ pub async fn deploy_ai_agent(
     })))
 }
 
+/// Execute an AI agent with REAL inference
+/// 
+/// This is a production implementation that:
+/// 1. Validates the agent exists and is active
+/// 2. Calls the actual AI runtime to execute the model
+/// 3. Records execution history and compute usage
+/// 4. Returns real inference output
 pub async fn execute_ai_agent(
     state: RpcState,
     params: Option<serde_json::Value>,
@@ -941,64 +950,170 @@ pub async fn execute_ai_agent(
         Err(_) => return Json(RpcResponse::error("Invalid agent ID format")),
     };
 
-    // Look up agent
-    let agents = state.ai_agents.read().await;
-    
-    if let Some(agent) = agents.get(&agent_id_bytes) {
-        if agent.status != "active" {
-            return Json(RpcResponse::error(&format!("Agent is not active: {}", agent.status)));
-        }
+    // Get caller/owner from params or use default
+    let caller = params.get("caller")
+        .and_then(|c| c.as_str())
+        .and_then(|c| bs58::decode(c).into_vec().ok())
+        .unwrap_or_else(|| vec![0u8; 32]);
 
-        // Get input data
-        let _input = params.get("input").cloned().unwrap_or(json!({}));
-        
-        // Simulate execution (in production, this would call the AI runtime)
-        let compute_units = 50000u64; // Base compute cost
-        
-        // Generate execution ID
+    // Get max compute budget from params
+    let max_compute = params.get("maxCompute")
+        .and_then(|m| m.as_u64())
+        .unwrap_or(100_000);
+
+    // Look up agent to get model hash and config
+    let (model_hash, config) = {
+        let agents = state.ai_agents.read().await;
+        match agents.get(&agent_id_bytes) {
+            Some(agent) => {
+                if agent.status != "active" {
+                    return Json(RpcResponse::error(&format!("Agent is not active: {}", agent.status)));
+                }
+                (agent.model_hash.clone(), agent.config.clone())
+            }
+            None => return Json(RpcResponse::error(&format!("Agent not found: {}", agent_id_str))),
+        }
+    };
+
+    // Get input data - serialize to bytes for the runtime
+    let input_data = params.get("input")
+        .map(|v| serde_json::to_vec(v).unwrap_or_default())
+        .unwrap_or_default();
+    
+    if input_data.is_empty() {
+        return Json(RpcResponse::error("Missing or empty input data"));
+    }
+
+    // Generate execution ID
+    let execution_id = {
         let mut hasher = Sha256::new();
         hasher.update(&agent_id_bytes);
+        hasher.update(&input_data);
         hasher.update(&std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos()
             .to_le_bytes());
-        let execution_id = hasher.finalize().to_vec();
+        hasher.finalize().to_vec()
+    };
 
-        drop(agents);
-
-        // Update agent stats
-        {
-            let mut agents = state.ai_agents.write().await;
-            if let Some(agent) = agents.get_mut(&agent_id_bytes) {
-                agent.execution_count += 1;
-                agent.total_compute_used += compute_units;
-            }
+    // Call the AI runtime if available through the state
+    // In production, this connects to the node's AI runtime
+    let ai_result = if let Some(ref ai_runtime) = state.ai_runtime {
+        // Ensure model is available (triggers P2P sync if needed)
+        let model_hash_bytes = bs58::decode(&model_hash).into_vec().unwrap_or_default();
+        if let Err(e) = ai_runtime.ensure_model_for_execution(&model_hash_bytes).await {
+            return Json(RpcResponse::error(&format!(
+                "Model not available: {}. Model sync may be in progress.", e
+            )));
         }
 
-        // Generate signature
+        // Execute the agent
+        use crate::ai_runtime_types::ExecutionRequest;
+        let request = ExecutionRequest {
+            agent_id: agent_id_bytes.clone(),
+            input_data: input_data.clone(),
+            max_compute,
+            caller: caller.clone(),
+        };
+
+        match ai_runtime.execute_agent(request).await {
+            Ok(result) => {
+                // Real execution succeeded
+                Some((result.output_data, result.compute_units_used, true, None))
+            }
+            Err(e) => {
+                // Real execution failed
+                Some((vec![], 0, false, Some(e.to_string())))
+            }
+        }
+    } else {
+        // No AI runtime connected - this is a configuration error in production
+        warn!("AI runtime not connected to RPC server - cannot execute agent");
+        None
+    };
+
+    // Process execution result
+    let (output_data, compute_units, success, error_msg) = match ai_result {
+        Some((data, compute, success, err)) => (data, compute, success, err),
+        None => {
+            return Json(RpcResponse::error(
+                "AI runtime not available. The node may not have AI execution enabled."
+            ));
+        }
+    };
+
+    if !success {
+        return Json(RpcResponse::error(&format!(
+            "AI execution failed: {}", 
+            error_msg.unwrap_or_else(|| "Unknown error".to_string())
+        )));
+    }
+
+    // Parse output as JSON if possible
+    let output_json = serde_json::from_slice::<serde_json::Value>(&output_data)
+        .unwrap_or_else(|_| {
+            // If not valid JSON, wrap as base64 string
+            json!({
+                "raw": base64::encode(&output_data),
+                "encoding": "base64"
+            })
+        });
+
+    // Update agent stats and record execution
+    {
+        let mut agents = state.ai_agents.write().await;
+        if let Some(agent) = agents.get_mut(&agent_id_bytes) {
+            agent.execution_count += 1;
+            agent.total_compute_used += compute_units;
+            
+            // Record in execution history
+            let input_hash = {
+                let mut h = Sha256::new();
+                h.update(&input_data);
+                h.finalize().to_vec()
+            };
+            
+            agent.execution_history.push(crate::state::ExecutionRecord {
+                execution_id: execution_id.clone(),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+                compute_used: compute_units,
+                success: true,
+                input_hash,
+            });
+            
+            // Limit history size
+            if agent.execution_history.len() > 100 {
+                agent.execution_history.remove(0);
+            }
+        }
+    }
+
+    // Generate signature for the execution
+    let signature = {
         let mut sig_hasher = Sha256::new();
         sig_hasher.update(&execution_id);
-        let signature = sig_hasher.finalize().to_vec();
+        sig_hasher.update(&output_data);
+        sig_hasher.finalize().to_vec()
+    };
 
-        // Update transaction count
-        {
-            let mut chain = state.chain_state.write().await;
-            chain.transaction_count += 1;
-        }
-
-        Json(RpcResponse::success(json!({
-            "executionId": bs58::encode(&execution_id).into_string(),
-            "signature": bs58::encode(&signature).into_string(),
-            "computeUnits": compute_units,
-            "output": {
-                "result": "AI execution completed",
-                "status": "success"
-            }
-        })))
-    } else {
-        Json(RpcResponse::error(&format!("Agent not found: {}", agent_id_str)))
+    // Update transaction count
+    {
+        let mut chain = state.chain_state.write().await;
+        chain.transaction_count += 1;
     }
+
+    Json(RpcResponse::success(json!({
+        "executionId": bs58::encode(&execution_id).into_string(),
+        "signature": bs58::encode(&signature).into_string(),
+        "computeUnits": compute_units,
+        "output": output_json,
+        "status": "success",
+        "modelHash": model_hash
+    })))
 }
 
 pub async fn get_ai_agent_info(
@@ -1336,6 +1451,10 @@ pub async fn bridge_withdraw(
     })))
 }
 
+/// Get bridge operation status - PRODUCTION implementation
+/// 
+/// Queries actual bridge operation state from storage, not fake data.
+/// Returns real confirmation counts, timestamps, and operation details.
 pub async fn get_bridge_status(
     state: RpcState,
     params: Option<serde_json::Value>,
@@ -1348,42 +1467,92 @@ pub async fn get_bridge_status(
         None => return Json(RpcResponse::error("Missing operation ID")),
     };
 
-    // Look up in transactions (bridge operations are stored as transactions)
-    let chain = state.chain_state.read().await;
-    let current_slot = chain.current_slot;
-    let finalized_slot = chain.finalized_slot;
-    drop(chain);
-
-    // Determine confirmation status based on slots
-    // In production, this would look up actual bridge operation state
-    let confirmations = if current_slot > finalized_slot {
-        (current_slot - finalized_slot).min(32) as u32
-    } else {
-        32
-    };
-
-    let status = if confirmations >= 32 {
-        "completed"
-    } else if confirmations >= 16 {
-        "confirmed"
-    } else {
-        "pending"
-    };
-
-    Json(RpcResponse::success(json!({
-        "id": operation_id,
-        "type": "bridge_operation",
-        "status": status,
-        "confirmations": confirmations,
-        "fromChain": "solana",
-        "toChain": "ade",
-        "currentSlot": current_slot,
-        "finalizedSlot": finalized_slot,
-        "timestamp": std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-    })))
+    // Look up the actual bridge operation from storage
+    let operation = state.get_bridge_operation(operation_id).await;
+    
+    match operation {
+        Some(op) => {
+            // Get current chain state for confirmation calculation
+            let chain = state.chain_state.read().await;
+            let current_slot = chain.current_slot;
+            drop(chain);
+            
+            // Calculate real confirmation progress
+            let status_str = match op.status {
+                crate::state::BridgeStatus::Pending => "pending",
+                crate::state::BridgeStatus::Confirming => "confirming",
+                crate::state::BridgeStatus::Confirmed => "confirmed",
+                crate::state::BridgeStatus::Executing => "executing",
+                crate::state::BridgeStatus::Completed => "completed",
+                crate::state::BridgeStatus::Failed => "failed",
+            };
+            
+            Json(RpcResponse::success(json!({
+                "id": op.id,
+                "type": op.operation_type,
+                "status": status_str,
+                "confirmations": op.confirmations,
+                "fromChain": op.from_chain,
+                "toChain": op.to_chain,
+                "amount": op.amount,
+                "token": bs58::encode(&op.token).into_string(),
+                "sender": bs58::encode(&op.sender).into_string(),
+                "recipient": bs58::encode(&op.recipient).into_string(),
+                "sourceTxHash": bs58::encode(&op.source_tx_hash).into_string(),
+                "targetTxHash": op.target_tx_hash.as_ref()
+                    .map(|h| bs58::encode(h).into_string()),
+                "createdAt": op.created_at,
+                "confirmedAt": op.confirmed_at,
+                "completedAt": op.completed_at,
+                "error": op.error,
+                "currentSlot": current_slot
+            })))
+        }
+        None => {
+            // Operation not found in state - might be a legacy or invalid ID
+            // Try to look up in transactions as fallback
+            let tx_hash = bs58::decode(operation_id).into_vec().ok();
+            
+            if let Some(hash) = tx_hash {
+                let txs = state.transactions.read().await;
+                if let Some(tx) = txs.get(&hash) {
+                    // Found as a transaction - return basic info
+                    let chain = state.chain_state.read().await;
+                    let confirmations = if chain.current_slot > tx.slot {
+                        (chain.current_slot - tx.slot).min(32) as u32
+                    } else {
+                        0
+                    };
+                    
+                    let status = match tx.status {
+                        crate::state::TransactionStatus::Pending => "pending",
+                        crate::state::TransactionStatus::Confirmed => {
+                            if confirmations >= 32 { "completed" } else { "confirming" }
+                        }
+                        crate::state::TransactionStatus::Finalized => "completed",
+                        crate::state::TransactionStatus::Failed => "failed",
+                    };
+                    
+                    return Json(RpcResponse::success(json!({
+                        "id": operation_id,
+                        "type": "transaction",
+                        "status": status,
+                        "confirmations": confirmations,
+                        "slot": tx.slot,
+                        "fee": tx.fee,
+                        "computeUnits": tx.compute_units,
+                        "currentSlot": chain.current_slot
+                    })));
+                }
+            }
+            
+            Json(RpcResponse::error(&format!(
+                "Bridge operation not found: {}. \
+                The operation may not exist or has not been processed yet.", 
+                operation_id
+            )))
+        }
+    }
 }
 
 pub async fn get_bridge_history(

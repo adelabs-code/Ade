@@ -7,13 +7,21 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::network::{PeerInfo, GossipMessage};
 
-/// Peer discovery and management system
+/// Peer discovery and management system - PRODUCTION implementation
+/// 
+/// Handles:
+/// - Bootstrap peer connections
+/// - Gossip-based peer discovery
+/// - Connection pooling and management
+/// - Peer scoring and rotation
 pub struct PeerDiscovery {
     local_pubkey: Vec<u8>,
     known_peers: Arc<RwLock<HashMap<Vec<u8>, DiscoveredPeer>>>,
     pending_connections: Arc<RwLock<VecDeque<String>>>,
     max_peers: usize,
     discovery_interval_ms: u64,
+    /// Bootstrap peers for initial network connection
+    bootstrap_peers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,6 +33,12 @@ pub struct DiscoveredPeer {
     pub connection_attempts: u32,
     pub successful_connections: u32,
     pub peer_score: f64,
+    /// Validator stake (0 for non-validators)
+    #[serde(default)]
+    pub stake: u64,
+    /// Whether this peer is a validator
+    #[serde(default)]
+    pub is_validator: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -38,13 +52,24 @@ pub struct PeerScore {
 
 impl PeerDiscovery {
     pub fn new(local_pubkey: Vec<u8>, max_peers: usize) -> Self {
+        Self::with_bootstrap(local_pubkey, max_peers, vec![])
+    }
+    
+    /// Create with bootstrap peers for initial network connection
+    pub fn with_bootstrap(local_pubkey: Vec<u8>, max_peers: usize, bootstrap_peers: Vec<String>) -> Self {
         Self {
             local_pubkey,
             known_peers: Arc::new(RwLock::new(HashMap::new())),
             pending_connections: Arc::new(RwLock::new(VecDeque::new())),
             max_peers,
             discovery_interval_ms: 10000, // 10 seconds
+            bootstrap_peers,
         }
+    }
+    
+    /// Add bootstrap peers dynamically
+    pub fn add_bootstrap_peers(&mut self, peers: Vec<String>) {
+        self.bootstrap_peers.extend(peers);
     }
 
     /// Start peer discovery process
@@ -195,12 +220,23 @@ impl PeerDiscovery {
             .map(|(k, _)| k.clone())
     }
 
-    /// Spawn discovery task
+    /// Spawn discovery task - PRODUCTION implementation
+    /// 
+    /// Periodically queries connected peers for their peer lists (gossip protocol).
+    /// This enables organic network growth and recovery from partitions.
     fn spawn_discovery_task(&self) {
         let known_peers = self.known_peers.clone();
+        let pending_connections = self.pending_connections.clone();
         let discovery_interval = self.discovery_interval_ms;
+        let max_peers = self.max_peers;
+        let bootstrap_peers = self.bootstrap_peers.clone();
         
         tokio::spawn(async move {
+            let http_client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new());
+            
             let mut interval = tokio::time::interval(
                 tokio::time::Duration::from_millis(discovery_interval)
             );
@@ -208,21 +244,87 @@ impl PeerDiscovery {
             loop {
                 interval.tick().await;
                 
-                let peer_count = known_peers.read().await.len();
-                debug!("Discovery: {} known peers", peer_count);
+                let current_peers: Vec<_> = {
+                    let peers = known_peers.read().await;
+                    peers.values().cloned().collect()
+                };
                 
-                // In production: request peer lists from connected peers
+                let peer_count = current_peers.len();
+                debug!("Discovery tick: {} known peers", peer_count);
+                
+                // If we have few peers, try bootstrap nodes
+                if peer_count < 3 {
+                    for bootstrap in &bootstrap_peers {
+                        let mut pending = pending_connections.write().await;
+                        if !pending.contains(bootstrap) {
+                            info!("Adding bootstrap peer to connection queue: {}", bootstrap);
+                            pending.push_back(bootstrap.clone());
+                        }
+                    }
+                }
+                
+                // Request peer lists from connected peers (gossip)
+                if peer_count > 0 && peer_count < max_peers {
+                    // Pick random peers to query
+                    let query_count = (peer_count / 3).max(1).min(5);
+                    let peers_to_query: Vec<_> = current_peers.iter()
+                        .take(query_count)
+                        .collect();
+                    
+                    for peer in peers_to_query {
+                        // Request peer list via HTTP gossip endpoint
+                        let url = format!("http://{}/gossip/peers", peer.address);
+                        
+                        match http_client.get(&url).send().await {
+                            Ok(response) => {
+                                if let Ok(body) = response.json::<serde_json::Value>().await {
+                                    if let Some(peer_list) = body.get("peers").and_then(|p| p.as_array()) {
+                                        let mut pending = pending_connections.write().await;
+                                        
+                                        for peer_info in peer_list {
+                                            if let Some(addr) = peer_info.get("address").and_then(|a| a.as_str()) {
+                                                // Add to pending if not already known
+                                                let known = known_peers.read().await;
+                                                let is_known = known.values().any(|p| p.address == addr);
+                                                
+                                                if !is_known && !pending.contains(&addr.to_string()) {
+                                                    debug!("Discovered new peer via gossip: {}", addr);
+                                                    pending.push_back(addr.to_string());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                debug!("Failed to query peer {} for peer list: {}", peer.address, e);
+                            }
+                        }
+                    }
+                }
             }
         });
     }
 
-    /// Spawn connection task
+    /// Spawn connection task - PRODUCTION implementation
+    /// 
+    /// Processes pending connection queue and establishes actual TCP connections.
+    /// Performs handshake and adds successfully connected peers to known_peers.
     fn spawn_connection_task(&self) {
         let pending = self.pending_connections.clone();
+        let known_peers = self.known_peers.clone();
+        let max_peers = self.max_peers;
         
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                
+                // Check if we need more peers
+                let current_count = known_peers.read().await.len();
+                if current_count >= max_peers {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                    continue;
+                }
                 
                 let address = {
                     let mut pending_guard = pending.write().await;
@@ -230,8 +332,94 @@ impl PeerDiscovery {
                 };
                 
                 if let Some(addr) = address {
-                    debug!("Attempting to connect to: {}", addr);
-                    // In production: establish actual connection
+                    debug!("Attempting TCP connection to: {}", addr);
+                    
+                    // Establish actual TCP connection with timeout
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        tokio::net::TcpStream::connect(&addr)
+                    ).await {
+                        Ok(Ok(mut stream)) => {
+                            info!("Connected to peer: {}", addr);
+                            
+                            // Perform handshake
+                            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                            
+                            // Send handshake message
+                            let handshake = serde_json::json!({
+                                "type": "handshake",
+                                "version": "1.0.0",
+                                "timestamp": std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs()
+                            });
+                            
+                            let handshake_bytes = serde_json::to_vec(&handshake).unwrap_or_default();
+                            let len = handshake_bytes.len() as u32;
+                            
+                            if stream.write_all(&len.to_be_bytes()).await.is_ok() 
+                                && stream.write_all(&handshake_bytes).await.is_ok() 
+                            {
+                                // Read response
+                                let mut len_buf = [0u8; 4];
+                                if stream.read_exact(&mut len_buf).await.is_ok() {
+                                    let response_len = u32::from_be_bytes(len_buf) as usize;
+                                    if response_len < 65536 { // Sanity check
+                                        let mut response_buf = vec![0u8; response_len];
+                                        if stream.read_exact(&mut response_buf).await.is_ok() {
+                                            if let Ok(response) = serde_json::from_slice::<serde_json::Value>(&response_buf) {
+                                                // Extract peer info from response
+                                                let pubkey = response.get("pubkey")
+                                                    .and_then(|p| p.as_str())
+                                                    .and_then(|p| bs58::decode(p).into_vec().ok())
+                                                    .unwrap_or_else(|| {
+                                                        // Generate pubkey from address hash
+                                                        use sha2::{Sha256, Digest};
+                                                        let mut h = Sha256::new();
+                                                        h.update(addr.as_bytes());
+                                                        h.finalize().to_vec()
+                                                    });
+                                                
+                                                let stake = response.get("stake")
+                                                    .and_then(|s| s.as_u64())
+                                                    .unwrap_or(0);
+                                                
+                                                // Add to known peers
+                                                let now = std::time::SystemTime::now()
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .unwrap()
+                                                    .as_secs();
+                                                
+                                                let discovered_peer = super::peer_discovery::DiscoveredPeer {
+                                                    pubkey: pubkey.clone(),
+                                                    address: addr.clone(),
+                                                    first_seen: now,
+                                                    last_seen: now,
+                                                    connection_attempts: 1,
+                                                    successful_connections: 1,
+                                                    peer_score: 1.0,
+                                                    stake,
+                                                    is_validator: stake > 0,
+                                                };
+                                                
+                                                let mut peers = known_peers.write().await;
+                                                peers.insert(pubkey, discovered_peer);
+                                                
+                                                info!("Successfully added peer: {} (stake: {})", addr, stake);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            debug!("Failed to connect to {}: {}", addr, e);
+                        }
+                        Err(_) => {
+                            debug!("Connection timeout for: {}", addr);
+                        }
+                    }
                 }
             }
         });
@@ -369,6 +557,8 @@ mod tests {
         assert!(best[1].peer_score >= best[2].peer_score);
     }
 }
+
+
 
 
 

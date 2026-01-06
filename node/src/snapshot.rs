@@ -84,12 +84,49 @@ impl SnapshotManager {
         let snapshot_path = self.get_snapshot_path(slot);
         let metadata_path = self.get_metadata_path(slot);
 
-        // Collect accounts from storage
+        // Collect all accounts from storage
         let mut accounts = Vec::new();
         let mut total_lamports = 0u64;
         
-        // Note: In full production, would iterate through all accounts in RocksDB
-        // For now, we provide the framework for account collection
+        // Iterate through all accounts in RocksDB
+        match storage.get_all_accounts() {
+            Ok(stored_accounts) => {
+                for (address, account_data) in stored_accounts {
+                    // Try to deserialize account data
+                    match bincode::deserialize::<AccountSnapshot>(&account_data) {
+                        Ok(account) => {
+                            total_lamports += account.lamports;
+                            accounts.push(account);
+                        }
+                        Err(_) => {
+                            // Try alternative deserialization (raw format)
+                            // Format: lamports (8 bytes) + owner (32 bytes) + data (rest)
+                            if account_data.len() >= 40 {
+                                let lamports = u64::from_le_bytes(
+                                    account_data[0..8].try_into().unwrap_or([0u8; 8])
+                                );
+                                let owner = account_data[8..40].to_vec();
+                                let data = account_data[40..].to_vec();
+                                
+                                total_lamports += lamports;
+                                accounts.push(AccountSnapshot {
+                                    address,
+                                    lamports,
+                                    owner,
+                                    data,
+                                });
+                            } else {
+                                debug!("Skipping account with invalid data format");
+                            }
+                        }
+                    }
+                }
+                info!("Collected {} accounts with {} total lamports", accounts.len(), total_lamports);
+            }
+            Err(e) => {
+                warn!("Failed to collect accounts from storage: {}", e);
+            }
+        }
         
         // Collect recent blocks (last 1000)
         let mut blocks = Vec::new();
