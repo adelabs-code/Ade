@@ -812,23 +812,21 @@ async fn generate_deposit_proof_async(
         hasher.finalize().to_vec()
     };
 
-    // Fetch actual Merkle proof from Solana RPC
-    let merkle_proof = match build_merkle_path_for_event_async(
+    // PRODUCTION: Fetch actual Merkle proof from Solana RPC
+    // No fallback - if RPC fails, the proof generation fails
+    let merkle_proof = build_merkle_path_for_event_async(
         client,
         rpc_url,
         &task.id,
         &event_hash,
         task.block_number,
-    ).await {
-        Ok(proof) => {
-            info!("Successfully fetched merkle proof from Solana RPC");
-            proof
-        }
-        Err(e) => {
-            warn!("Failed to fetch merkle proof from RPC ({}), using computed fallback", e);
-            build_merkle_path_for_event(&task.id, &event_hash, task.block_number)
-        }
-    };
+    ).await.map_err(|e| {
+        error!("CRITICAL: Failed to fetch Merkle proof from RPC: {}", e);
+        error!("Deposit proof generation aborted - no fallback proofs allowed");
+        anyhow::anyhow!("Merkle proof fetch failed: {}. Check RPC connectivity.", e)
+    })?;
+    
+    info!("Successfully fetched Merkle proof from Solana RPC ({} elements)", merkle_proof.len());
     
     // Create and sign the proof message
     // SECURITY: This requires a valid keypair - no mock signatures allowed
@@ -847,10 +845,22 @@ async fn generate_deposit_proof_async(
 
 /// Synchronous wrapper for generate_deposit_proof_async
 /// 
-/// SECURITY: This function now requires a keypair parameter.
-/// Proofs without valid signatures are rejected by the bridge.
-fn generate_deposit_proof(task: &RelayTask, relayer_keypair: Option<&ed25519_dalek::Keypair>) -> Result<BridgeProof> {
+/// PRODUCTION: This function requires:
+/// 1. A valid RPC URL for fetching Merkle proofs
+/// 2. A valid keypair for signing proofs
+/// 
+/// Without these, the function will return an error.
+fn generate_deposit_proof(
+    task: &RelayTask,
+    relayer_keypair: Option<&ed25519_dalek::Keypair>,
+    rpc_url: &str,
+) -> Result<BridgeProof> {
     use sha2::{Sha256, Digest};
+    
+    // Validate required parameters
+    if rpc_url.is_empty() {
+        return Err(anyhow::anyhow!("RPC URL required for Merkle proof generation"));
+    }
     
     // Generate event hash
     let event_hash = {
@@ -859,12 +869,22 @@ fn generate_deposit_proof(task: &RelayTask, relayer_keypair: Option<&ed25519_dal
         hasher.finalize().to_vec()
     };
 
-    // Use computed merkle proof (sync version)
-    let merkle_proof = build_merkle_path_for_event(&task.id, &event_hash, task.block_number);
+    // PRODUCTION: Fetch real Merkle proof from RPC
+    let merkle_proof = build_merkle_path_for_event_sync(
+        rpc_url,
+        &task.id,
+        &event_hash,
+        task.block_number,
+    ).map_err(|e| {
+        error!("Failed to fetch Merkle proof for deposit: {}", e);
+        anyhow::anyhow!("Merkle proof generation failed - cannot process deposit: {}", e)
+    })?;
     
     // Sign the proof - REQUIRES valid keypair
     let proof_message = create_proof_message(&task.id, task.block_number, &task.data);
     let relayer_signature = sign_proof_message_with_key(&proof_message, relayer_keypair)?;
+
+    info!("Generated deposit proof with {} Merkle path elements", merkle_proof.len());
 
     Ok(BridgeProof {
         source_chain: task.source_chain.clone(),
@@ -878,9 +898,18 @@ fn generate_deposit_proof(task: &RelayTask, relayer_keypair: Option<&ed25519_dal
 
 /// Generate withdrawal proof with Merkle path from event data
 /// 
-/// SECURITY: Requires valid keypair for signing. No mock signatures.
-fn generate_withdrawal_proof(task: &RelayTask, relayer_keypair: Option<&ed25519_dalek::Keypair>) -> Result<BridgeProof> {
+/// PRODUCTION: Requires valid RPC URL and keypair. No fallback proofs.
+fn generate_withdrawal_proof(
+    task: &RelayTask,
+    relayer_keypair: Option<&ed25519_dalek::Keypair>,
+    rpc_url: &str,
+) -> Result<BridgeProof> {
     use sha2::{Sha256, Digest};
+    
+    // Validate required parameters
+    if rpc_url.is_empty() {
+        return Err(anyhow::anyhow!("RPC URL required for Merkle proof generation"));
+    }
     
     let event_hash = {
         let mut hasher = Sha256::new();
@@ -888,12 +917,22 @@ fn generate_withdrawal_proof(task: &RelayTask, relayer_keypair: Option<&ed25519_
         hasher.finalize().to_vec()
     };
 
-    // Build Merkle proof for withdrawal event
-    let merkle_proof = build_merkle_path_for_event(&task.id, &event_hash, task.block_number);
+    // PRODUCTION: Fetch real Merkle proof from RPC
+    let merkle_proof = build_merkle_path_for_event_sync(
+        rpc_url,
+        &task.id,
+        &event_hash,
+        task.block_number,
+    ).map_err(|e| {
+        error!("Failed to fetch Merkle proof for withdrawal: {}", e);
+        anyhow::anyhow!("Merkle proof generation failed - cannot process withdrawal: {}", e)
+    })?;
     
     // Sign the proof - REQUIRES valid keypair
     let proof_message = create_proof_message(&task.id, task.block_number, &task.data);
     let relayer_signature = sign_proof_message_with_key(&proof_message, relayer_keypair)?;
+
+    info!("Generated withdrawal proof with {} Merkle path elements", merkle_proof.len());
 
     Ok(BridgeProof {
         source_chain: task.source_chain.clone(),
@@ -1077,36 +1116,68 @@ fn build_merkle_proof_from_leaves(leaves: &[Vec<u8>], target: &[u8]) -> Result<V
     Ok(proof_path)
 }
 
-/// Synchronous wrapper for build_merkle_path_for_event_async (for non-async contexts)
-/// Falls back to computed proof if RPC is not available
-fn build_merkle_path_for_event(tx_hash: &[u8], event_hash: &[u8], block_number: u64) -> Vec<Vec<u8>> {
-    use sha2::{Sha256, Digest};
+/// Build Merkle proof using synchronous RPC call via tokio runtime
+/// 
+/// PRODUCTION: This function requires a valid RPC connection.
+/// Fake proofs are NOT generated - if RPC fails, an error is returned.
+/// 
+/// For production deployment, ensure:
+/// 1. Reliable RPC endpoint with proper failover
+/// 2. Adequate timeout and retry configuration  
+/// 3. Monitoring for proof generation failures
+fn build_merkle_path_for_event_sync(
+    rpc_url: &str,
+    tx_hash: &[u8],
+    event_hash: &[u8],
+    block_number: u64,
+) -> Result<Vec<Vec<u8>>> {
+    // Use tokio runtime for async RPC call in sync context
+    let runtime = tokio::runtime::Handle::try_current()
+        .or_else(|_| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map(|rt| rt.handle().clone())
+        })
+        .map_err(|e| anyhow::anyhow!("Failed to get tokio runtime: {}", e))?;
     
-    // In async contexts, use build_merkle_path_for_event_async instead
-    // This fallback computes a deterministic proof based on available data
-    warn!("Using fallback merkle proof generation - async version recommended");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to create HTTP client: {}", e))?;
     
-    // Create a minimal proof that includes the event hash and computed siblings
-    let mut proof_path = Vec::new();
+    let rpc_url = rpc_url.to_string();
+    let tx_hash = tx_hash.to_vec();
+    let event_hash = event_hash.to_vec();
     
-    // Level 0: Hash the event data
-    let mut hasher = Sha256::new();
-    hasher.update(b"event_leaf");
-    hasher.update(event_hash);
-    let leaf_hash = hasher.finalize().to_vec();
+    runtime.block_on(async move {
+        build_merkle_path_for_event_async(
+            &client,
+            &rpc_url,
+            &tx_hash,
+            &event_hash,
+            block_number,
+        ).await
+    })
+}
+
+/// DEPRECATED: Old fallback function - now returns error instead of fake proof
+/// 
+/// This function previously generated deterministic fake proofs when RPC failed.
+/// In production, fake proofs are a security vulnerability as they:
+/// 1. Cannot be verified against the actual blockchain state
+/// 2. Allow forged transactions to pass verification
+/// 3. Break the trust assumption of the bridge
+#[deprecated(since = "1.0.0", note = "Use build_merkle_path_for_event_sync or async version")]
+fn build_merkle_path_for_event(_tx_hash: &[u8], _event_hash: &[u8], _block_number: u64) -> Vec<Vec<u8>> {
+    // PRODUCTION: This should never be called
+    // Keeping the signature for backward compatibility but it will cause verification failure
+    error!("CRITICAL: build_merkle_path_for_event fallback called - this produces invalid proofs!");
+    error!("Update your code to use build_merkle_path_for_event_sync() or the async version");
     
-    // Build 4 levels of proof (for up to 16 transactions per block)
-    for level in 0..4 {
-        let mut level_hasher = Sha256::new();
-        level_hasher.update(b"merkle_sibling_v2");
-        level_hasher.update(tx_hash);
-        level_hasher.update(&block_number.to_le_bytes());
-        level_hasher.update(&[level as u8]);
-        level_hasher.update(&leaf_hash);
-        proof_path.push(level_hasher.finalize().to_vec());
-    }
-    
-    proof_path
+    // Return empty proof - will fail verification
+    // This is intentional: better to fail explicitly than silently forge proofs
+    Vec::new()
 }
 
 /// Create a message to be signed for the proof

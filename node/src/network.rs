@@ -228,35 +228,243 @@ pub enum GossipMessage {
     },
 }
 
+/// Network configuration for production deployment
+/// 
+/// This should be loaded from a configuration file (e.g., genesis.json or network.toml)
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct NetworkConfig {
+    /// The genesis block hash - MUST match all nodes in the network
+    pub genesis_hash: String,
+    /// Network identifier (e.g., "mainnet", "testnet", "devnet")
+    pub network_id: String,
+    /// Protocol version for compatibility checks
+    pub protocol_version: u32,
+    /// Path to the node's keypair file
+    pub keypair_path: Option<String>,
+    /// List of bootstrap nodes to connect to
+    pub bootstrap_nodes: Vec<String>,
+    /// Whether this node should act as a validator
+    pub is_validator: bool,
+    /// The gossip port
+    pub gossip_port: u16,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            genesis_hash: String::new(),
+            network_id: "devnet".to_string(),
+            protocol_version: 1,
+            keypair_path: None,
+            bootstrap_nodes: vec![],
+            is_validator: false,
+            gossip_port: 8000,
+        }
+    }
+}
+
+impl NetworkConfig {
+    /// Load network configuration from a TOML file
+    pub fn from_file(path: &str) -> Result<Self> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("Failed to read network config file '{}': {}", path, e))?;
+        
+        // Try TOML first, then JSON
+        if path.ends_with(".toml") {
+            toml::from_str(&content)
+                .map_err(|e| anyhow::anyhow!("Failed to parse TOML config: {}", e))
+        } else {
+            serde_json::from_str(&content)
+                .map_err(|e| anyhow::anyhow!("Failed to parse JSON config: {}", e))
+        }
+    }
+    
+    /// Create a devnet configuration for testing
+    pub fn devnet(gossip_port: u16) -> Self {
+        Self {
+            genesis_hash: "ADE_DEVNET_GENESIS_V1".to_string(),
+            network_id: "devnet".to_string(),
+            protocol_version: 1,
+            keypair_path: None,
+            bootstrap_nodes: vec![],
+            is_validator: false,
+            gossip_port,
+        }
+    }
+}
+
 impl NetworkManager {
-    /// Create a new NetworkManager with generated keypair
-    pub fn new(gossip_port: u16, bootstrap_nodes: Vec<String>) -> Result<Self> {
+    /// PRODUCTION: Create NetworkManager from configuration file
+    /// 
+    /// This is the recommended way to initialize the network in production.
+    /// The config file should contain the genesis hash and other network parameters.
+    pub fn from_config(config: NetworkConfig) -> Result<Self> {
         use rand::rngs::OsRng;
         
-        // Generate a new keypair for this node
-        let mut csprng = OsRng;
-        let node_keypair = ed25519_dalek::Keypair::generate(&mut csprng);
+        // Validate genesis hash
+        if config.genesis_hash.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Genesis hash is required. Set genesis_hash in your network config file."
+            ));
+        }
         
-        // Default genesis hash (should be loaded from config in production)
-        let genesis_hash = Self::compute_default_genesis_hash();
+        // Load or generate keypair
+        let node_keypair = if let Some(ref keypair_path) = config.keypair_path {
+            let keypair_bytes = std::fs::read(keypair_path)
+                .map_err(|e| anyhow::anyhow!("Failed to read keypair file '{}': {}", keypair_path, e))?;
+            
+            if keypair_bytes.len() == 64 {
+                ed25519_dalek::Keypair::from_bytes(&keypair_bytes)
+                    .map_err(|e| anyhow::anyhow!("Invalid keypair bytes: {}", e))?
+            } else if keypair_bytes.len() == 32 {
+                let secret = ed25519_dalek::SecretKey::from_bytes(&keypair_bytes)
+                    .map_err(|e| anyhow::anyhow!("Invalid secret key: {}", e))?;
+                let public = ed25519_dalek::PublicKey::from(&secret);
+                ed25519_dalek::Keypair { secret, public }
+            } else {
+                return Err(anyhow::anyhow!(
+                    "Invalid keypair file length: expected 32 or 64 bytes, got {}",
+                    keypair_bytes.len()
+                ));
+            }
+        } else {
+            warn!("No keypair file specified - generating ephemeral keypair");
+            let mut csprng = OsRng;
+            ed25519_dalek::Keypair::generate(&mut csprng)
+        };
         
-        // Message cache with 5 minute TTL and 50K max entries
-        // TTL ensures old messages are eventually forgotten
-        // FIFO eviction prevents full cache clear (which causes broadcast storms)
+        // Parse genesis hash from config
+        let genesis_hash = Self::parse_genesis_hash(&config.genesis_hash)?;
+        
+        info!("Network initialized:");
+        info!("  Network ID: {}", config.network_id);
+        info!("  Genesis: {}", bs58::encode(&genesis_hash).into_string());
+        info!("  Node ID: {}", bs58::encode(node_keypair.public.as_bytes()).into_string());
+        info!("  Validator: {}", config.is_validator);
+        
         let message_cache = TimeCache::new(50_000, Duration::from_secs(300));
         
         Ok(Self {
-            gossip_port,
-            bootstrap_nodes,
+            gossip_port: config.gossip_port,
+            bootstrap_nodes: config.bootstrap_nodes,
             peers: Arc::new(RwLock::new(HashMap::new())),
             message_cache: Arc::new(tokio::sync::Mutex::new(message_cache)),
             max_peers: 1000,
             node_keypair,
             genesis_hash,
-            is_validator: false,
+            is_validator: config.is_validator,
             gossip_params: GossipParams::default(),
             mesh_peers: Arc::new(RwLock::new(HashSet::new())),
         })
+    }
+    
+    /// Parse genesis hash from string (supports hex, base58, or raw string)
+    fn parse_genesis_hash(hash_str: &str) -> Result<Vec<u8>> {
+        // Try hex first (0x prefix or just hex)
+        let hex_str = hash_str.strip_prefix("0x").unwrap_or(hash_str);
+        if let Ok(bytes) = hex::decode(hex_str) {
+            if bytes.len() == 32 {
+                return Ok(bytes);
+            }
+        }
+        
+        // Try base58
+        if let Ok(bytes) = bs58::decode(hash_str).into_vec() {
+            if bytes.len() == 32 {
+                return Ok(bytes);
+            }
+        }
+        
+        // Compute hash from string (for named networks like "mainnet", "testnet")
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(b"ADE_GENESIS_HASH:");
+        hasher.update(hash_str.as_bytes());
+        Ok(hasher.finalize().to_vec())
+    }
+    
+    /// Create a new NetworkManager with generated keypair
+    /// 
+    /// DEPRECATED: Use from_config() for production deployments.
+    /// This constructor is retained for backward compatibility and testing.
+    #[deprecated(since = "1.0.0", note = "Use from_config() for production")]
+    pub fn new(gossip_port: u16, bootstrap_nodes: Vec<String>) -> Result<Self> {
+        warn!("Using NetworkManager::new() - this is deprecated for production use");
+        warn!("Configure your network with from_config() and a proper genesis.toml file");
+        
+        let config = NetworkConfig::devnet(gossip_port);
+        let mut config = config;
+        config.bootstrap_nodes = bootstrap_nodes;
+        
+        // For devnet/testing, allow ephemeral genesis
+        Self::from_config_internal(config, true)
+    }
+    
+    /// Internal constructor that allows ephemeral genesis for testing
+    fn from_config_internal(config: NetworkConfig, allow_empty_genesis: bool) -> Result<Self> {
+        use rand::rngs::OsRng;
+        
+        // Validate genesis hash (unless testing)
+        if config.genesis_hash.is_empty() && !allow_empty_genesis {
+            return Err(anyhow::anyhow!(
+                "Genesis hash is required. Set genesis_hash in your network config file."
+            ));
+        }
+        
+        let genesis_hash = if config.genesis_hash.is_empty() {
+            // Generate test genesis for devnet
+            Self::compute_test_genesis_hash()
+        } else {
+            Self::parse_genesis_hash(&config.genesis_hash)?
+        };
+        
+        let node_keypair = if let Some(ref keypair_path) = config.keypair_path {
+            let keypair_bytes = std::fs::read(keypair_path)
+                .map_err(|e| anyhow::anyhow!("Failed to read keypair file '{}': {}", keypair_path, e))?;
+            
+            if keypair_bytes.len() == 64 {
+                ed25519_dalek::Keypair::from_bytes(&keypair_bytes)
+                    .map_err(|e| anyhow::anyhow!("Invalid keypair bytes: {}", e))?
+            } else if keypair_bytes.len() == 32 {
+                let secret = ed25519_dalek::SecretKey::from_bytes(&keypair_bytes)
+                    .map_err(|e| anyhow::anyhow!("Invalid secret key: {}", e))?;
+                let public = ed25519_dalek::PublicKey::from(&secret);
+                ed25519_dalek::Keypair { secret, public }
+            } else {
+                return Err(anyhow::anyhow!(
+                    "Invalid keypair file length: expected 32 or 64 bytes, got {}",
+                    keypair_bytes.len()
+                ));
+            }
+        } else {
+            let mut csprng = OsRng;
+            ed25519_dalek::Keypair::generate(&mut csprng)
+        };
+        
+        let message_cache = TimeCache::new(50_000, Duration::from_secs(300));
+        
+        Ok(Self {
+            gossip_port: config.gossip_port,
+            bootstrap_nodes: config.bootstrap_nodes,
+            peers: Arc::new(RwLock::new(HashMap::new())),
+            message_cache: Arc::new(tokio::sync::Mutex::new(message_cache)),
+            max_peers: 1000,
+            node_keypair,
+            genesis_hash,
+            is_validator: config.is_validator,
+            gossip_params: GossipParams::default(),
+            mesh_peers: Arc::new(RwLock::new(HashSet::new())),
+        })
+    }
+    
+    /// Compute test genesis hash for devnet/testing only
+    fn compute_test_genesis_hash() -> Vec<u8> {
+        use sha2::{Sha256, Digest};
+        warn!("Using test genesis hash - NOT FOR PRODUCTION");
+        let mut hasher = Sha256::new();
+        hasher.update(b"ADE_DEVNET_GENESIS_V1");
+        hasher.update(&chrono::Utc::now().timestamp().to_le_bytes());
+        hasher.finalize().to_vec()
     }
     
     /// Create a NetworkManager with a specific keypair and genesis hash
@@ -319,15 +527,48 @@ impl NetworkManager {
         Self::with_identity(gossip_port, bootstrap_nodes, &keypair_bytes, genesis_hash, is_validator)
     }
     
-    /// Compute default genesis hash (for testing only)
-    fn compute_default_genesis_hash() -> Vec<u8> {
-        use sha2::{Sha256, Digest};
-        warn!("Using default genesis hash - this should only be used for testing!");
-        let mut hasher = Sha256::new();
-        hasher.update(b"ADE_GENESIS_BLOCK_V1");
-        hasher.update(&[0u8; 32]); // Previous block hash (none for genesis)
-        hasher.update(&0u64.to_le_bytes()); // Slot 0
-        hasher.finalize().to_vec()
+    /// Load genesis configuration from standard locations
+    /// 
+    /// Searches for genesis config in order:
+    /// 1. Environment variable ADE_GENESIS_CONFIG
+    /// 2. ./genesis.toml
+    /// 3. ./config/genesis.toml
+    /// 4. ~/.ade/genesis.toml
+    pub fn load_genesis_config() -> Result<NetworkConfig> {
+        // Check environment variable first
+        if let Ok(path) = std::env::var("ADE_GENESIS_CONFIG") {
+            return NetworkConfig::from_file(&path);
+        }
+        
+        // Check standard locations
+        let search_paths = [
+            "genesis.toml".to_string(),
+            "config/genesis.toml".to_string(),
+            dirs::home_dir()
+                .map(|h| h.join(".ade/genesis.toml").to_string_lossy().to_string())
+                .unwrap_or_default(),
+        ];
+        
+        for path in &search_paths {
+            if !path.is_empty() && std::path::Path::new(path).exists() {
+                info!("Loading genesis config from: {}", path);
+                return NetworkConfig::from_file(path);
+            }
+        }
+        
+        Err(anyhow::anyhow!(
+            "No genesis configuration found. Create genesis.toml or set ADE_GENESIS_CONFIG environment variable."
+        ))
+    }
+    
+    /// Get the genesis hash for verification during handshake
+    pub fn get_genesis_hash(&self) -> &[u8] {
+        &self.genesis_hash
+    }
+    
+    /// Get the network's protocol version
+    pub fn get_protocol_version(&self) -> u32 {
+        1 // Increment when making breaking protocol changes
     }
 
     pub async fn start(&self) -> Result<()> {
