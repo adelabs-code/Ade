@@ -519,3 +519,4 @@ Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for gu
 ## Contact
 
 - Twitter: [@Ade__labs](https://twitter.com/Ade__labs)
+- CA: `6Rov3KdwFTtDBknkkk9jRhCLvjkA686TiQBpqje6BAGS`
